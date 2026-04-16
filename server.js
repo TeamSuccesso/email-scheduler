@@ -32,6 +32,7 @@ mongoose.connect(process.env.MONGO_URI)
 // ── Token storage (file-based) ────────────────────────────────────────────────
 
 const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+const AUTH_META_FILE = path.join(__dirname, 'auth.json');
 
 function loadTokens() {
   if (!fs.existsSync(TOKENS_FILE)) return {};
@@ -41,6 +42,30 @@ function loadTokens() {
 
 function saveTokens(tokens) {
   fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+}
+
+function loadAuthMeta() {
+  if (!fs.existsSync(AUTH_META_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8')); }
+  catch (_) { return {}; }
+}
+
+function saveAuthMeta(meta) {
+  fs.writeFileSync(AUTH_META_FILE, JSON.stringify(meta || {}, null, 2));
+}
+
+function listTokenEmails(tokens) {
+  return Object.keys(tokens || {}).filter(k => k.includes('@'));
+}
+
+function getPrimaryUserEmail() {
+  const allTokens = loadTokens();
+  const emails = listTokenEmails(allTokens);
+  if (!emails.length) return null;
+
+  const meta = loadAuthMeta();
+  if (meta.lastConnectedEmail && allTokens[meta.lastConnectedEmail]) return meta.lastConnectedEmail;
+  return emails[0];
 }
 
 // ── OAuth2 client ─────────────────────────────────────────────────────────────
@@ -77,7 +102,8 @@ app.get('/oauth/url', (req, res) => {
       'https://www.googleapis.com/auth/userinfo.email',
     ],
   });
-  res.json({ url });
+  // res.json({ url });
+  res.redirect(url);
 });
 
 // ── OAuth: callback ───────────────────────────────────────────────────────────
@@ -100,6 +126,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
     allTokens[email] = tokens;
     saveTokens(allTokens);
+    saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
 
     console.log(`✅ Tokens saved for ${email}`);
     res.send(`
@@ -136,8 +163,52 @@ app.post('/oauth/token', (req, res) => {
 
   allTokens[email] = merged;
   saveTokens(allTokens);
+  saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
   console.log(`💾 Token updated for ${email} (has refresh: ${!!merged.refresh_token})`);
   res.json({ ok: true });
+});
+
+// ── Auth status (used by Chrome extension UI) ────────────────────────────────
+
+app.get('/auth/status', (req, res) => {
+  try {
+    const email = getPrimaryUserEmail();
+    res.json({ connected: !!email, email: email || null });
+  } catch (err) {
+    res.status(500).json({ connected: false, email: null, error: err.message });
+  }
+});
+
+// Optional: Disconnect (delete stored tokens)
+app.post('/auth/disconnect', (req, res) => {
+  try {
+    const allTokens = loadTokens();
+    const email = (req.body?.email || '').toString().trim();
+    const mode = (req.body?.mode || '').toString().trim(); // "all" or ""
+
+    if (mode === 'all') {
+      for (const k of Object.keys(allTokens)) delete allTokens[k];
+      saveTokens(allTokens);
+      saveAuthMeta({});
+      return res.json({ ok: true });
+    }
+
+    if (email && allTokens[email]) {
+      delete allTokens[email];
+      saveTokens(allTokens);
+    }
+
+    const remaining = listTokenEmails(loadTokens());
+    if (!remaining.length) saveAuthMeta({});
+    else {
+      const meta = loadAuthMeta();
+      if (meta.lastConnectedEmail === email) saveAuthMeta({ lastConnectedEmail: remaining[0], connectedAt: new Date().toISOString() });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ── Schedule / update an email ────────────────────────────────────────────────
@@ -148,13 +219,9 @@ app.post('/schedule', async (req, res) => {
     if (!incoming || !incoming.id) return res.status(400).json({ error: 'Invalid email data' });
 
     if (!incoming.userEmail) {
-      const allTokens = loadTokens();
-      const users = Object.keys(allTokens);
-      if (users.length > 0) {
-        incoming.userEmail = users[0];
-      } else {
-        return res.status(400).json({ error: 'No authenticated user — cannot schedule email' });
-      }
+      const primary = getPrimaryUserEmail();
+      if (primary) incoming.userEmail = primary;
+      else return res.status(400).json({ error: 'No authenticated user — cannot schedule email' });
     }
 
     // If this schedule request came from the Chrome extension, treat Chrome as online immediately
@@ -189,6 +256,60 @@ app.post('/schedule', async (req, res) => {
   } catch (err) {
     console.error('Schedule error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Send now (used by Chrome extension when Chrome is open) ──────────────────
+
+app.post('/send-now', async (req, res) => {
+  try {
+    const incoming = req.body?.email || req.body;
+    if (!incoming || !incoming.id) return res.status(400).json({ ok: false, error: 'Invalid email data' });
+
+    if (!incoming.userEmail) {
+      const primary = getPrimaryUserEmail();
+      if (primary) incoming.userEmail = primary;
+      else return res.status(400).json({ ok: false, error: 'No authenticated user' });
+    }
+
+    incoming.to  = sanitizeRecipient(incoming.to);
+    incoming.cc  = sanitizeRecipient(incoming.cc);
+    incoming.bcc = sanitizeRecipient(incoming.bcc);
+
+    const existing = await Email.findOne({ id: incoming.id });
+    const merged = existing ? { ...existing.toObject(), ...incoming } : incoming;
+
+    // If attachments were not included in this request, keep stored attachments.
+    if ((!Array.isArray(merged.attachments) || merged.attachments.length === 0) && existing?.attachments?.length) {
+      merged.attachments = existing.attachments;
+    }
+
+    await Email.findOneAndUpdate({ id: merged.id }, merged, { upsert: true });
+
+    await sendEmailViaGmail(merged);
+
+    const now = new Date();
+    const newSentCount = (merged.sentCount || 0) + 1;
+    const isOnce       = merged.recurrence?.once === true || merged.type === 'once';
+    const reachedMax   = merged.maxTimes !== 'indefinitely' && newSentCount >= parseInt(merged.maxTimes);
+    const isDone       = isOnce || reachedMax;
+
+    const nextSendTime = isDone ? null : computeNextSendTime(merged);
+
+    const updated = await Email.findOneAndUpdate(
+      { id: merged.id },
+      {
+        sentCount: newSentCount,
+        lastSent: now.toISOString(),
+        active: isDone ? false : merged.active,
+        nextSendTime,
+      },
+      { returnDocument: 'after' }
+    );
+
+    res.json({ ok: true, email: updated });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
