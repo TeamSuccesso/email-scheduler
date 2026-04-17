@@ -238,12 +238,28 @@ app.post('/schedule', async (req, res) => {
     const existing = await Email.findOne({ id: incoming.id });
 
     if (existing) {
+      const wantsClear = incoming.clearAttachments === true;
+      const updateDoc = {
+        ...incoming,
+        sentCount: incoming.sentCount ?? existing.sentCount ?? 0,
+        lastSent: incoming.lastSent ?? existing.lastSent ?? null,
+      };
+
+      if (!wantsClear) {
+        if (existing.attachments?.length && (!Array.isArray(incoming.attachments) || incoming.attachments.length === 0)) {
+          delete updateDoc.attachments;
+        }
+        if (existing.attachmentIds?.length && (!Array.isArray(incoming.attachmentIds) || incoming.attachmentIds.length === 0)) {
+          delete updateDoc.attachmentIds;
+        }
+      } else {
+        updateDoc.attachments = [];
+        updateDoc.attachmentIds = [];
+      }
+
             await Email.findOneAndUpdate(
         { id: incoming.id },
-        { ...incoming,
-          sentCount: incoming.sentCount ?? existing.sentCount ?? 0,
-          lastSent: incoming.lastSent ?? existing.lastSent ?? null,
-        },
+        updateDoc,
         { returnDocument: 'after' }
       );
       console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(incoming.attachments || []).length}`);
@@ -307,7 +323,7 @@ app.post('/send-now', async (req, res) => {
       { returnDocument: 'after' }
     );
 
-    res.json({ ok: true, email: updated });
+    res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -348,7 +364,7 @@ app.patch('/schedule/:id', async (req, res) => {
       { new: true }
     );
     if (!updated) return res.status(404).json({ error: 'Not found' });
-    res.json({ ok: true, email: updated });
+    res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -362,6 +378,13 @@ function sanitizeRecipient(val) {
   if (Array.isArray(val)) return val.map(v => (typeof v === 'string' ? v : v?.email || v?.address || '')).filter(Boolean).join(',');
   const str = String(val).trim();
   return str === '[object Object]' ? '' : str;
+}
+
+function stripEmailPayload(emailDoc) {
+  if (!emailDoc) return emailDoc;
+  const obj = typeof emailDoc.toObject === 'function' ? emailDoc.toObject() : { ...emailDoc };
+  delete obj.attachments; // can be very large (base64)
+  return obj;
 }
 
 function isEmailDone(email) {
@@ -400,9 +423,14 @@ function computeNextSendTime(email) {
   }
 
   if (r.months) {
+    const fallbackFromNext = email.nextSendTime ? new Date(email.nextSendTime).getDate() : now.getDate();
+    const targetDay = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : fallbackFromNext;
     const next = new Date(now);
-    next.setMonth(next.getMonth() + r.months);
     next.setHours(h, m, 0, 0);
+    next.setDate(1);
+    next.setMonth(next.getMonth() + r.months);
+    const dim = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate();
+    next.setDate(Math.min(Math.max(1, targetDay), dim));
     return next.toISOString();
   }
 
@@ -413,6 +441,16 @@ function computeNextSendTime(email) {
 }
 
 // ── Send email via Gmail API ──────────────────────────────────────────────────
+
+function chunkBase64Lines(b64, lineLen = 76) {
+  const s = String(b64 || '').replace(/\r?\n/g, '');
+  if (!s) return '';
+  let out = '';
+  for (let i = 0; i < s.length; i += lineLen) {
+    out += s.slice(i, i + lineLen) + '\r\n';
+  }
+  return out.replace(/\r\n$/, '');
+}
 
 async function sendEmailViaGmail(email) {
   // ✅ FIX: Sanitize recipient at send time to catch any corrupted DB records
@@ -452,8 +490,10 @@ async function sendEmailViaGmail(email) {
   const bccHeader = sanitizeRecipient(email.bcc);
 
   const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
-  const bodyHtml   = email.body || '';
-  const bodyB64    = Buffer.from(bodyHtml, 'utf8').toString('base64');
+  const bodyType   = email.bodyType === 'html' ? 'html' : 'text';
+  const bodyContentType = bodyType === 'html' ? 'text/html' : 'text/plain';
+  const bodyContent = email.body || '';
+  const bodyB64    = chunkBase64Lines(Buffer.from(bodyContent, 'utf8').toString('base64'));
 
   const attachments = Array.isArray(email.attachments)
     ? email.attachments.filter(a => a && a.dataBase64)
@@ -468,7 +508,7 @@ async function sendEmailViaGmail(email) {
       bccHeader ? `Bcc: ${bccHeader}` : null,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       'MIME-Version: 1.0',
-      'Content-Type: text/html; charset=UTF-8',
+      `Content-Type: ${bodyContentType}; charset=UTF-8`,
       'Content-Transfer-Encoding: base64',
       '',
       bodyB64,
@@ -476,7 +516,7 @@ async function sendEmailViaGmail(email) {
   } else {
     const parts = [
       `--${boundary}`,
-      'Content-Type: text/html; charset=UTF-8',
+      `Content-Type: ${bodyContentType}; charset=UTF-8`,
       'Content-Transfer-Encoding: base64',
       '',
       bodyB64,
@@ -494,7 +534,7 @@ async function sendEmailViaGmail(email) {
       parts.push(`Content-Disposition: attachment; filename="${attName}"`);
       parts.push('Content-Transfer-Encoding: base64');
       parts.push('');
-      parts.push(b64);
+      parts.push(chunkBase64Lines(b64));
     }
     parts.push(`--${boundary}--`);
 
