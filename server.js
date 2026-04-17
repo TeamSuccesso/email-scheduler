@@ -8,6 +8,7 @@ const path       = require('path');
 const { google } = require('googleapis');
 const mongoose   = require('mongoose');
 const Email      = require('./models/Email');
+const AuthState  = require('./models/AuthState');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -34,36 +35,81 @@ mongoose.connect(process.env.MONGO_URI)
 const TOKENS_FILE = path.join(__dirname, 'tokens.json');
 const AUTH_META_FILE = path.join(__dirname, 'auth.json');
 
-function loadTokens() {
-  if (!fs.existsSync(TOKENS_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8')); }
-  catch (_) { return {}; }
+let _tokensCache = null;
+let _authMetaCache = null;
+
+async function loadTokens() {
+  if (_tokensCache) return _tokensCache;
+  try {
+    if (mongoose.connection.readyState === 1) {
+      const doc = await AuthState.findOne({ key: 'tokens' }).lean();
+      if (doc?.value && typeof doc.value === 'object') {
+        _tokensCache = doc.value;
+        return _tokensCache;
+      }
+    }
+  } catch (_) {}
+  // Fallback: file-based
+  if (!fs.existsSync(TOKENS_FILE)) { _tokensCache = {}; return _tokensCache; }
+  try { _tokensCache = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8')); return _tokensCache; }
+  catch (_) { _tokensCache = {}; return _tokensCache; }
 }
 
-function saveTokens(tokens) {
-  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+async function saveTokens(tokens) {
+  _tokensCache = tokens || {};
+  try {
+    if (mongoose.connection.readyState === 1) {
+      await AuthState.findOneAndUpdate(
+        { key: 'tokens' },
+        { value: _tokensCache },
+        { upsert: true }
+      );
+    }
+  } catch (_) {}
+  // Best-effort mirror to file for local dev
+  try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(_tokensCache, null, 2)); } catch (_) {}
 }
 
-function loadAuthMeta() {
-  if (!fs.existsSync(AUTH_META_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8')); }
-  catch (_) { return {}; }
+async function loadAuthMeta() {
+  if (_authMetaCache) return _authMetaCache;
+  try {
+    if (mongoose.connection.readyState === 1) {
+      const doc = await AuthState.findOne({ key: 'meta' }).lean();
+      if (doc?.value && typeof doc.value === 'object') {
+        _authMetaCache = doc.value;
+        return _authMetaCache;
+      }
+    }
+  } catch (_) {}
+  if (!fs.existsSync(AUTH_META_FILE)) { _authMetaCache = {}; return _authMetaCache; }
+  try { _authMetaCache = JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8')); return _authMetaCache; }
+  catch (_) { _authMetaCache = {}; return _authMetaCache; }
 }
 
-function saveAuthMeta(meta) {
-  fs.writeFileSync(AUTH_META_FILE, JSON.stringify(meta || {}, null, 2));
+async function saveAuthMeta(meta) {
+  _authMetaCache = meta || {};
+  try {
+    if (mongoose.connection.readyState === 1) {
+      await AuthState.findOneAndUpdate(
+        { key: 'meta' },
+        { value: _authMetaCache },
+        { upsert: true }
+      );
+    }
+  } catch (_) {}
+  try { fs.writeFileSync(AUTH_META_FILE, JSON.stringify(_authMetaCache, null, 2)); } catch (_) {}
 }
 
 function listTokenEmails(tokens) {
   return Object.keys(tokens || {}).filter(k => k.includes('@'));
 }
 
-function getPrimaryUserEmail() {
-  const allTokens = loadTokens();
+async function getPrimaryUserEmail() {
+  const allTokens = await loadTokens();
   const emails = listTokenEmails(allTokens);
   if (!emails.length) return null;
 
-  const meta = loadAuthMeta();
+  const meta = await loadAuthMeta();
   if (meta.lastConnectedEmail && allTokens[meta.lastConnectedEmail]) return meta.lastConnectedEmail;
   return emails[0];
 }
@@ -120,13 +166,13 @@ app.get('/oauth/callback', async (req, res) => {
     const { data }  = await oauth2Api.userinfo.get();
     const email     = data.email;
 
-    const allTokens  = loadTokens();
+    const allTokens  = await loadTokens();
     if (allTokens[email]?.refresh_token && !tokens.refresh_token) {
       tokens.refresh_token = allTokens[email].refresh_token;
     }
     allTokens[email] = tokens;
-    saveTokens(allTokens);
-    saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
+    await saveTokens(allTokens);
+    await saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
 
     console.log(`✅ Tokens saved for ${email}`);
     res.send(`
@@ -144,11 +190,11 @@ app.get('/oauth/callback', async (req, res) => {
 
 // ── Save token from extension ─────────────────────────────────────────────────
 
-app.post('/oauth/token', (req, res) => {
+app.post('/oauth/token', async (req, res) => {
   const { email, tokens } = req.body;
   if (!email || !tokens) return res.status(400).json({ error: 'Missing email or tokens' });
 
-  const allTokens = loadTokens();
+  const allTokens = await loadTokens();
   const existing  = allTokens[email] || {};
 
   const merged = {
@@ -162,8 +208,8 @@ app.post('/oauth/token', (req, res) => {
   }
 
   allTokens[email] = merged;
-  saveTokens(allTokens);
-  saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
+  await saveTokens(allTokens);
+  await saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
   console.log(`💾 Token updated for ${email} (has refresh: ${!!merged.refresh_token})`);
   res.json({ ok: true });
 });
@@ -171,38 +217,35 @@ app.post('/oauth/token', (req, res) => {
 // ── Auth status (used by Chrome extension UI) ────────────────────────────────
 
 app.get('/auth/status', (req, res) => {
-  try {
-    const email = getPrimaryUserEmail();
-    res.json({ connected: !!email, email: email || null });
-  } catch (err) {
-    res.status(500).json({ connected: false, email: null, error: err.message });
-  }
+  getPrimaryUserEmail()
+    .then(email => res.json({ connected: !!email, email: email || null }))
+    .catch(err => res.status(500).json({ connected: false, email: null, error: err.message }));
 });
 
 // Optional: Disconnect (delete stored tokens)
-app.post('/auth/disconnect', (req, res) => {
+app.post('/auth/disconnect', async (req, res) => {
   try {
-    const allTokens = loadTokens();
+    const allTokens = await loadTokens();
     const email = (req.body?.email || '').toString().trim();
     const mode = (req.body?.mode || '').toString().trim(); // "all" or ""
 
     if (mode === 'all') {
       for (const k of Object.keys(allTokens)) delete allTokens[k];
-      saveTokens(allTokens);
-      saveAuthMeta({});
+      await saveTokens(allTokens);
+      await saveAuthMeta({});
       return res.json({ ok: true });
     }
 
     if (email && allTokens[email]) {
       delete allTokens[email];
-      saveTokens(allTokens);
+      await saveTokens(allTokens);
     }
 
-    const remaining = listTokenEmails(loadTokens());
-    if (!remaining.length) saveAuthMeta({});
+    const remaining = listTokenEmails(await loadTokens());
+    if (!remaining.length) await saveAuthMeta({});
     else {
-      const meta = loadAuthMeta();
-      if (meta.lastConnectedEmail === email) saveAuthMeta({ lastConnectedEmail: remaining[0], connectedAt: new Date().toISOString() });
+      const meta = await loadAuthMeta();
+      if (meta.lastConnectedEmail === email) await saveAuthMeta({ lastConnectedEmail: remaining[0], connectedAt: new Date().toISOString() });
     }
 
     res.json({ ok: true });
@@ -219,7 +262,7 @@ app.post('/schedule', async (req, res) => {
     if (!incoming || !incoming.id) return res.status(400).json({ error: 'Invalid email data' });
 
     if (!incoming.userEmail) {
-      const primary = getPrimaryUserEmail();
+      const primary = await getPrimaryUserEmail();
       if (primary) incoming.userEmail = primary;
       else return res.status(400).json({ error: 'No authenticated user — cannot schedule email' });
     }
@@ -283,7 +326,7 @@ app.post('/send-now', async (req, res) => {
     if (!incoming || !incoming.id) return res.status(400).json({ ok: false, error: 'Invalid email data' });
 
     if (!incoming.userEmail) {
-      const primary = getPrimaryUserEmail();
+      const primary = await getPrimaryUserEmail();
       if (primary) incoming.userEmail = primary;
       else return res.status(400).json({ ok: false, error: 'No authenticated user' });
     }
@@ -300,9 +343,17 @@ app.post('/send-now', async (req, res) => {
       merged.attachments = existing.attachments;
     }
 
-    await Email.findOneAndUpdate({ id: merged.id }, merged, { upsert: true });
+    // Persist latest payload before acquiring lock (do not overwrite lock fields here)
+    const mergedToStore = { ...merged };
+    delete mergedToStore.inFlightUntil;
+    await Email.findOneAndUpdate({ id: merged.id }, mergedToStore, { upsert: true });
 
-    await sendEmailViaGmail(merged);
+    const locked = await tryAcquireSendLock(merged.id);
+    if (!locked) {
+      return res.status(409).json({ ok: false, error: 'Email is already sending. Please try again in a moment.' });
+    }
+
+    await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked);
 
     const now = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
@@ -319,12 +370,14 @@ app.post('/send-now', async (req, res) => {
         lastSent: now.toISOString(),
         active: isDone ? false : merged.active,
         nextSendTime,
+        inFlightUntil: null,
       },
       { returnDocument: 'after' }
     );
 
     res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
+    try { await releaseSendLock(req.body?.email?.id || req.body?.id); } catch (_) {}
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -385,6 +438,28 @@ function stripEmailPayload(emailDoc) {
   const obj = typeof emailDoc.toObject === 'function' ? emailDoc.toObject() : { ...emailDoc };
   delete obj.attachments; // can be very large (base64)
   return obj;
+}
+
+async function tryAcquireSendLock(emailId, lockMs = 2 * 60_000) {
+  const nowIso   = new Date().toISOString();
+  const untilIso = new Date(Date.now() + lockMs).toISOString();
+  const doc = await Email.findOneAndUpdate(
+    {
+      id: emailId,
+      $or: [
+        { inFlightUntil: null },
+        { inFlightUntil: { $lt: nowIso } },
+      ],
+    },
+    { inFlightUntil: untilIso },
+    { returnDocument: 'after' }
+  );
+  return doc;
+}
+
+async function releaseSendLock(emailId) {
+  if (!emailId) return;
+  await Email.findOneAndUpdate({ id: emailId }, { inFlightUntil: null });
 }
 
 function isEmailDone(email) {
@@ -459,7 +534,7 @@ async function sendEmailViaGmail(email) {
     throw new Error('Recipient address required');
   }
 
-  const allTokens = loadTokens();
+  const allTokens = await loadTokens();
   const userEmail = email.userEmail || Object.keys(allTokens)[0];
   if (!userEmail) throw new Error('No authenticated user found');
 
@@ -478,7 +553,7 @@ async function sendEmailViaGmail(email) {
     tokens.access_token = newTokens.access_token;
     tokens.expiry_date  = newTokens.expiry_date;
     allTokens[userEmail] = tokens;
-    saveTokens(allTokens);
+    void saveTokens(allTokens);
     console.log(`🔄 Token refreshed for ${userEmail}`);
   });
 
@@ -568,10 +643,6 @@ cron.schedule('* * * * *', async () => {
     const emails = await Email.find({ active: true });
 
     for (const email of emails) {
-      const hb = chromeHeartbeat.get(email.userEmail);
-      if (hb && (Date.now() - hb) < HEARTBEAT_TTL_MS) {
-        continue;
-      }
       if (isEmailDone(email)) continue;
       if (!email.nextSendTime)  continue;
 
@@ -596,7 +667,9 @@ cron.schedule('* * * * *', async () => {
       console.log(`⏰ Firing: "${email.subject}" (scheduled ${sendAt.toISOString()})`);
 
       try {
-        await sendEmailViaGmail(email);
+        const locked = await tryAcquireSendLock(email.id);
+        if (!locked) continue; // another sender (Chrome or cron) is handling it
+        await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked);
 
         const newSentCount = (email.sentCount || 0) + 1;
         const isOnce       = email.recurrence?.once === true || email.type === 'once';
@@ -611,6 +684,7 @@ cron.schedule('* * * * *', async () => {
           lastSent:     now.toISOString(),
           active:       isDone ? false : email.active,
           nextSendTime: isDone ? null  : computeNextSendTime(email),
+          inFlightUntil: null,
         },
         { returnDocument: 'after' }
       );
@@ -627,11 +701,11 @@ cron.schedule('* * * * *', async () => {
 
         if (isAuthError) {
           console.log(`🔒 Auth error — deactivating "${email.subject}"`);
-          await Email.findOneAndUpdate({ id: email.id }, { active: false });
+          await Email.findOneAndUpdate({ id: email.id }, { active: false, inFlightUntil: null });
         } else {
           const retryAt = new Date(Date.now() + 5 * 60_000).toISOString();
           console.log(`🔁 Temporary error — will retry "${email.subject}" at ${retryAt}`);
-          await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: retryAt });
+          await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: retryAt, inFlightUntil: null });
         }
       }
     }

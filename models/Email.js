@@ -21,6 +21,7 @@ const emailSchema = new mongoose.Schema({
 
   nextSendTime: { type: String, default: null },
   lastSent:     { type: String, default: null },
+  inFlightUntil:{ type: String, default: null },
 
   sentCount: { type: Number,  default: 0 },
   maxTimes:  { type: String,  default: 'indefinitely' },
