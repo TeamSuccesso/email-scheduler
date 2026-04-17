@@ -38,25 +38,43 @@ const AUTH_META_FILE = path.join(__dirname, 'auth.json');
 let _tokensCache = null;
 let _authMetaCache = null;
 
-async function loadTokens() {
-  if (_tokensCache) return _tokensCache;
+function setTokensCache(next) {
+  const normalized = (next && typeof next === 'object') ? next : {};
+  if (!_tokensCache) {
+    _tokensCache = normalized;
+    return _tokensCache;
+  }
+  if (_tokensCache === normalized) return _tokensCache;
+
+  // Mutate in-place so any existing references keep seeing updates.
+  for (const k of Object.keys(_tokensCache)) {
+    if (!(k in normalized)) delete _tokensCache[k];
+  }
+  for (const [k, v] of Object.entries(normalized)) {
+    _tokensCache[k] = v;
+  }
+  return _tokensCache;
+}
+
+async function loadTokens(opts = {}) {
+  const forceReload = opts?.forceReload === true;
+  if (_tokensCache && !forceReload) return _tokensCache;
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'tokens' }).lean();
       if (doc?.value && typeof doc.value === 'object') {
-        _tokensCache = doc.value;
-        return _tokensCache;
+        return setTokensCache(doc.value);
       }
     }
   } catch (_) {}
   // Fallback: file-based
-  if (!fs.existsSync(TOKENS_FILE)) { _tokensCache = {}; return _tokensCache; }
-  try { _tokensCache = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8')); return _tokensCache; }
-  catch (_) { _tokensCache = {}; return _tokensCache; }
+  if (!fs.existsSync(TOKENS_FILE)) return setTokensCache({});
+  try { return setTokensCache(JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'))); }
+  catch (_) { return setTokensCache({}); }
 }
 
 async function saveTokens(tokens) {
-  _tokensCache = tokens || {};
+  setTokensCache(tokens);
   try {
     if (mongoose.connection.readyState === 1) {
       await AuthState.findOneAndUpdate(
@@ -70,24 +88,40 @@ async function saveTokens(tokens) {
   try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(_tokensCache, null, 2)); } catch (_) {}
 }
 
-async function loadAuthMeta() {
-  if (_authMetaCache) return _authMetaCache;
+function setAuthMetaCache(next) {
+  const normalized = (next && typeof next === 'object') ? next : {};
+  if (!_authMetaCache) {
+    _authMetaCache = normalized;
+    return _authMetaCache;
+  }
+  if (_authMetaCache === normalized) return _authMetaCache;
+  for (const k of Object.keys(_authMetaCache)) {
+    if (!(k in normalized)) delete _authMetaCache[k];
+  }
+  for (const [k, v] of Object.entries(normalized)) {
+    _authMetaCache[k] = v;
+  }
+  return _authMetaCache;
+}
+
+async function loadAuthMeta(opts = {}) {
+  const forceReload = opts?.forceReload === true;
+  if (_authMetaCache && !forceReload) return _authMetaCache;
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'meta' }).lean();
       if (doc?.value && typeof doc.value === 'object') {
-        _authMetaCache = doc.value;
-        return _authMetaCache;
+        return setAuthMetaCache(doc.value);
       }
     }
   } catch (_) {}
-  if (!fs.existsSync(AUTH_META_FILE)) { _authMetaCache = {}; return _authMetaCache; }
-  try { _authMetaCache = JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8')); return _authMetaCache; }
-  catch (_) { _authMetaCache = {}; return _authMetaCache; }
+  if (!fs.existsSync(AUTH_META_FILE)) return setAuthMetaCache({});
+  try { return setAuthMetaCache(JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8'))); }
+  catch (_) { return setAuthMetaCache({}); }
 }
 
 async function saveAuthMeta(meta) {
-  _authMetaCache = meta || {};
+  setAuthMetaCache(meta);
   try {
     if (mongoose.connection.readyState === 1) {
       await AuthState.findOneAndUpdate(
@@ -115,6 +149,50 @@ async function getPrimaryUserEmail() {
 }
 
 // ── OAuth2 client ─────────────────────────────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isAccessTokenExpired(tokens, skewMs = 30_000) {
+  const expiry = Number(tokens?.expiry_date);
+  if (!Number.isFinite(expiry) || expiry <= 0) return false;
+  return expiry <= (Date.now() + skewMs);
+}
+
+function extractGoogleApiError(err) {
+  const status = err?.code || err?.response?.status || null;
+  const data = err?.response?.data;
+  const apiMsg = data?.error?.message || err?.message || 'Unknown Gmail API error';
+  const reason =
+    data?.error?.errors?.[0]?.reason ||
+    data?.error?.status ||
+    null;
+  return { status, apiMsg, reason, data };
+}
+
+class GmailSendError extends Error {
+  constructor(message, opts = {}) {
+    super(message);
+    this.name = 'GmailSendError';
+    this.httpStatus = opts.httpStatus || 500;
+    this.googleStatus = opts.googleStatus || null;
+    this.googleReason = opts.googleReason || null;
+    this.diagnostics = opts.diagnostics || null;
+  }
+}
+
+async function deactivateEmail(email, reason) {
+  try {
+    if (!email?.id) return;
+    await Email.findOneAndUpdate(
+      { id: email.id },
+      { active: false, inFlightUntil: null },
+      { returnDocument: 'after' }
+    );
+    console.warn(`🔒 Deactivated email ${email.id}${reason ? ` (${reason})` : ''}`);
+  } catch (_) {}
+}
 
 function makeOAuthClient() {
   return new google.auth.OAuth2(
@@ -386,13 +464,156 @@ app.post('/send-now', async (req, res) => {
 
     res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    const status = (err && typeof err === 'object' && Number.isFinite(err.httpStatus))
+      ? err.httpStatus
+      : 500;
+    res.status(status).json({ ok: false, error: err?.message || String(err || 'Unknown error') });
   } finally {
     try { await releaseSendLock(emailIdForUnlock); } catch (_) {}
   }
 });
 
 // ── Get emails for a user ─────────────────────────────────────────────────────
+
+// Diagnostic endpoint for debugging Gmail API auth/sending
+// POST /test-send { userEmail: "..." }
+app.post('/test-send', async (req, res) => {
+  const requestedEmail = (req.body?.userEmail || '').toString().trim() || null;
+  const diagnostics = {
+    requestedEmail,
+    resolvedUserEmail: null,
+    token: null,
+    tokenInfo: null,
+    profile: null,
+    send: null,
+    gmailError: null,
+  };
+
+  try {
+    console.log('[test-send] start', { requestedEmail });
+
+    const allTokens = await loadTokens();
+    const userEmail = requestedEmail || await getPrimaryUserEmail() || Object.keys(allTokens)[0];
+    diagnostics.resolvedUserEmail = userEmail || null;
+    if (!userEmail) return res.status(400).json({ ok: false, error: 'No authenticated user found', diagnostics });
+
+    const tokens = allTokens[userEmail];
+    if (!tokens) return res.status(404).json({ ok: false, error: `No tokens for ${userEmail}`, diagnostics });
+
+    diagnostics.token = {
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expiry_date: tokens.expiry_date || null,
+      isExpired: isAccessTokenExpired(tokens),
+    };
+    console.log('[test-send] token loaded', diagnostics.token);
+
+    const oauth2 = makeOAuthClient();
+    oauth2.setCredentials(tokens);
+    console.log('[test-send] credentials set');
+
+    if (tokens.access_token) {
+      try {
+        const info = await oauth2.getTokenInfo(tokens.access_token);
+        diagnostics.tokenInfo = {
+          expires_in: info?.expires_in ?? null,
+          scope: info?.scope ?? null,
+        };
+        diagnostics.tokenInfo.hasGmailSendScope = String(info?.scope || '').includes('gmail.send');
+        console.log('[test-send] tokenInfo', diagnostics.tokenInfo);
+      } catch (e) {
+        diagnostics.tokenInfo = { error: String(e?.message || e) };
+        console.warn('[test-send] tokenInfo failed', diagnostics.tokenInfo);
+      }
+    }
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+
+    try {
+      const prof = await gmail.users.getProfile({ userId: 'me' });
+      diagnostics.profile = { emailAddress: prof?.data?.emailAddress || null };
+      diagnostics.profile.mismatch = !!(
+        diagnostics.profile.emailAddress &&
+        diagnostics.profile.emailAddress.toLowerCase() !== String(userEmail).toLowerCase()
+      );
+      console.log('[test-send] profile', diagnostics.profile);
+    } catch (e) {
+      diagnostics.profile = { error: String(e?.message || e) };
+      console.warn('[test-send] profile failed', diagnostics.profile);
+    }
+
+    const subject = `Test send ${new Date().toISOString()}`;
+    const subjectB64 = Buffer.from(subject, 'utf8').toString('base64');
+    const body = `Test email sent at ${new Date().toISOString()} from Recurring Gmail server.`;
+    const bodyB64 = chunkBase64Lines(Buffer.from(body, 'utf8').toString('base64'));
+    const mime = [
+      `From: ${userEmail}`,
+      `To: ${userEmail}`,
+      `Subject: =?UTF-8?B?${subjectB64}?=`,
+      `Date: ${new Date().toUTCString()}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      bodyB64,
+    ].join('\r\n');
+
+    const raw = Buffer.from(mime, 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    console.log('[test-send] sending…');
+
+    const delays = [2000, 4000, 8000];
+    let lastErr = null;
+    let responseData = null;
+
+    for (let attempt = 0; attempt < (delays.length + 1); attempt++) {
+      try {
+        const resp = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+        responseData = resp?.data || null;
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        const { status, apiMsg } = extractGoogleApiError(e);
+        const retryable = Number.isFinite(status) && status >= 500 && status < 600;
+        if (retryable && attempt < delays.length) {
+          const waitMs = delays[attempt];
+          console.warn(`[test-send] Gmail 5xx (${status}). Retry ${attempt + 1}/${delays.length} in ${waitMs}ms: ${apiMsg}`);
+          await sleep(waitMs);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (lastErr) {
+      const { status, apiMsg, reason, data } = extractGoogleApiError(lastErr);
+      diagnostics.gmailError = {
+        status: status || null,
+        reason: reason || null,
+        message: apiMsg,
+        raw: data?.error || data || null,
+      };
+      console.error('[test-send] failed', diagnostics.gmailError);
+      return res.status(Number.isFinite(status) ? status : 500).json({
+        ok: false,
+        error: `Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}`,
+        diagnostics,
+      });
+    }
+
+    diagnostics.send = { ok: true, response: responseData };
+    console.log('[test-send] success', responseData);
+    return res.json({ ok: true, diagnostics });
+  } catch (err) {
+    console.error('[test-send] unexpected error', err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err || 'Unknown error'), diagnostics });
+  }
+});
 
 app.get('/emails', async (req, res) => {
   try {
@@ -545,11 +766,24 @@ async function sendEmailViaGmail(email) {
   }
 
   const allTokens = await loadTokens();
-  const userEmail = email.userEmail || Object.keys(allTokens)[0];
+  const userEmail = email.userEmail || await getPrimaryUserEmail() || Object.keys(allTokens)[0];
   if (!userEmail) throw new Error('No authenticated user found');
 
   const tokens = allTokens[userEmail];
   if (!tokens) throw new Error(`No tokens for ${userEmail}`);
+
+  const isExpired = isAccessTokenExpired(tokens);
+  if (isExpired && !tokens.refresh_token) {
+    const msg = 'Token expired and no refresh_token available. Please reconnect via /oauth/url';
+    console.error(msg, {
+      userEmail,
+      expiry_date: tokens.expiry_date || null,
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: false,
+    });
+    await deactivateEmail(email, 'token_expired_no_refresh');
+    throw new GmailSendError(msg, { httpStatus: 401, diagnostics: { userEmail, expiry_date: tokens.expiry_date || null } });
+  }
 
   if (!tokens.refresh_token) {
     console.warn(`⚠️  No refresh_token for ${userEmail} — will fail if access_token is expired`);
@@ -560,8 +794,8 @@ async function sendEmailViaGmail(email) {
 
   oauth2.on('tokens', (newTokens) => {
     if (newTokens.refresh_token) tokens.refresh_token = newTokens.refresh_token;
-    tokens.access_token = newTokens.access_token;
-    tokens.expiry_date  = newTokens.expiry_date;
+    if (newTokens.access_token) tokens.access_token = newTokens.access_token;
+    if (newTokens.expiry_date) tokens.expiry_date  = newTokens.expiry_date;
     allTokens[userEmail] = tokens;
     void saveTokens(allTokens);
     console.log(`🔄 Token refreshed for ${userEmail}`);
@@ -647,15 +881,78 @@ async function sendEmailViaGmail(email) {
     .replace(/=+$/, '');
 
   try {
-    await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+    const delays = [2000, 4000, 8000];
+    for (let attempt = 0; attempt < (delays.length + 1); attempt++) {
+      try {
+        await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+        break;
+      } catch (err) {
+        const { status, apiMsg } = extractGoogleApiError(err);
+        const retryable = Number.isFinite(status) && status >= 500 && status < 600;
+        if (retryable && attempt < delays.length) {
+          const waitMs = delays[attempt];
+          console.warn(`Gmail 5xx (${status}). Retry ${attempt + 1}/${delays.length} in ${waitMs}ms: ${apiMsg}`);
+          await sleep(waitMs);
+          continue;
+        }
+        throw err;
+      }
+    }
   } catch (err) {
-    const status = err?.code || err?.response?.status;
-    const apiMsg = err?.response?.data?.error?.message || err?.message || 'Unknown Gmail API error';
+    const { status, apiMsg, reason, data } = extractGoogleApiError(err);
     let extra = '';
+
+    const diagnostics = {
+      userEmail,
+      google: { status: status || null, reason: reason || null },
+      token: {
+        hasAccessToken: !!tokens.access_token,
+        hasRefreshToken: !!tokens.refresh_token,
+        expiry_date: tokens.expiry_date || null,
+        isExpired: isAccessTokenExpired(tokens),
+      },
+    };
+
+    const isFailedPrecondition =
+      status === 400 && (String(apiMsg).toLowerCase().includes('precondition') || reason === 'failedPrecondition');
+
+    if (isFailedPrecondition) {
+      try {
+        if (tokens.access_token) {
+          const info = await oauth2.getTokenInfo(tokens.access_token);
+          diagnostics.tokenInfo = {
+            expires_in: info?.expires_in ?? null,
+            scope: info?.scope ?? null,
+          };
+          diagnostics.hasGmailSendScope = String(info?.scope || '').includes('gmail.send');
+        }
+      } catch (e) {
+        diagnostics.tokenInfoError = String(e?.message || e);
+      }
+
+      try {
+        const prof = await gmail.users.getProfile({ userId: 'me' });
+        diagnostics.profileEmail = prof?.data?.emailAddress || null;
+        if (diagnostics.profileEmail && diagnostics.profileEmail.toLowerCase() !== String(userEmail).toLowerCase()) {
+          diagnostics.profileMismatch = true;
+        }
+      } catch (e) {
+        diagnostics.profileError = String(e?.message || e);
+      }
+
+      console.error('❌ Gmail failedPrecondition (400). Diagnostics:', diagnostics);
+    } else {
+      console.error('❌ Gmail send failed:', { status, reason, apiMsg });
+    }
     if (String(apiMsg).toLowerCase().includes('precondition')) {
       extra = ' (If this is a Google Workspace account, ask your admin to enable Gmail API and allow third‑party access for this user, then reconnect.)';
     }
-    throw new Error(`Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}${extra}`);
+    throw new GmailSendError(`Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}${extra}`, {
+      httpStatus: Number.isFinite(status) ? status : 500,
+      googleStatus: status || null,
+      googleReason: reason || null,
+      diagnostics: { ...diagnostics, rawGoogleError: data?.error || data || null },
+    });
   }
   console.log(`✅ Sent: "${email.subject}" → ${toHeader} | attachments: ${attachments.length}`);
 }
@@ -719,10 +1016,13 @@ cron.schedule('* * * * *', async () => {
 
         // ✅ FIX: Only permanently deactivate on auth errors.
         // For network/temporary errors, retry in 5 minutes instead of killing the schedule.
-        const isAuthError = err.message.includes('401') ||
-                            err.message.includes('No tokens') ||
-                            err.message.includes('No refresh') ||
-                            err.message.includes('No authenticated');
+        const msg = String(err?.message || '');
+        const isAuthError = msg.includes('401') ||
+                            msg.includes('No tokens') ||
+                            msg.includes('No refresh') ||
+                            msg.includes('refresh_token') ||
+                            msg.includes('Token expired') ||
+                            msg.includes('No authenticated');
 
         if (isAuthError) {
           console.log(`🔒 Auth error — deactivating "${email.subject}"`);
