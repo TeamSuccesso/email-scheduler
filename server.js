@@ -573,6 +573,7 @@ async function sendEmailViaGmail(email) {
   const toHeader  = toStr;
   const ccHeader  = sanitizeRecipient(email.cc);
   const bccHeader = sanitizeRecipient(email.bcc);
+  const fromHeader = sanitizeRecipient(email.from) || userEmail;
 
   const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
   const bodyType   = email.bodyType === 'html' ? 'html' : 'text';
@@ -588,10 +589,12 @@ async function sendEmailViaGmail(email) {
 
   if (attachments.length === 0) {
     mime = [
+      `From: ${fromHeader}`,
       `To: ${toHeader}`,
       ccHeader  ? `Cc: ${ccHeader}`   : null,
       bccHeader ? `Bcc: ${bccHeader}` : null,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
+      `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
       `Content-Type: ${bodyContentType}; charset=UTF-8`,
       'Content-Transfer-Encoding: base64',
@@ -624,10 +627,12 @@ async function sendEmailViaGmail(email) {
     parts.push(`--${boundary}--`);
 
     mime = [
+      `From: ${fromHeader}`,
       `To: ${toHeader}`,
       ccHeader  ? `Cc: ${ccHeader}`   : null,
       bccHeader ? `Bcc: ${bccHeader}` : null,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
+      `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
       `Content-Type: multipart/mixed; boundary="${boundary}"`,
       '',
@@ -641,7 +646,17 @@ async function sendEmailViaGmail(email) {
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 
-  await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+  try {
+    await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+  } catch (err) {
+    const status = err?.code || err?.response?.status;
+    const apiMsg = err?.response?.data?.error?.message || err?.message || 'Unknown Gmail API error';
+    let extra = '';
+    if (String(apiMsg).toLowerCase().includes('precondition')) {
+      extra = ' (If this is a Google Workspace account, ask your admin to enable Gmail API and allow third‑party access for this user, then reconnect.)';
+    }
+    throw new Error(`Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}${extra}`);
+  }
   console.log(`✅ Sent: "${email.subject}" → ${toHeader} | attachments: ${attachments.length}`);
 }
 
