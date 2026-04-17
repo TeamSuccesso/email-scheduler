@@ -321,9 +321,11 @@ app.post('/schedule', async (req, res) => {
 // ── Send now (used by Chrome extension when Chrome is open) ──────────────────
 
 app.post('/send-now', async (req, res) => {
+  let emailIdForUnlock = null;
   try {
     const incoming = req.body?.email || req.body;
     if (!incoming || !incoming.id) return res.status(400).json({ ok: false, error: 'Invalid email data' });
+    emailIdForUnlock = incoming.id;
 
     if (!incoming.userEmail) {
       const primary = await getPrimaryUserEmail();
@@ -350,7 +352,14 @@ app.post('/send-now', async (req, res) => {
 
     const locked = await tryAcquireSendLock(merged.id);
     if (!locked) {
-      return res.status(409).json({ ok: false, error: 'Email is already sending. Please try again in a moment.' });
+      const current = await Email.findOne({ id: merged.id });
+      return res.status(409).json({
+        ok: false,
+        inProgress: true,
+        retryAfterMs: 30_000,
+        email: stripEmailPayload(current),
+        error: 'Email is already sending. Please try again in a moment.',
+      });
     }
 
     await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked);
@@ -377,8 +386,9 @@ app.post('/send-now', async (req, res) => {
 
     res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
-    try { await releaseSendLock(req.body?.email?.id || req.body?.id); } catch (_) {}
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    try { await releaseSendLock(emailIdForUnlock); } catch (_) {}
   }
 });
 
@@ -707,6 +717,8 @@ cron.schedule('* * * * *', async () => {
           console.log(`🔁 Temporary error — will retry "${email.subject}" at ${retryAt}`);
           await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: retryAt, inFlightUntil: null });
         }
+      } finally {
+        try { await releaseSendLock(email.id); } catch (_) {}
       }
     }
   } catch (err) {
