@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const emailSchema = new mongoose.Schema({
   id:        { type: String, required: true, unique: true },
   userEmail: { type: String, default: '' },
+  // Normalized copy for case-insensitive lookups (kept in sync in hooks/server routes)
+  userEmailLower: { type: String, default: '', index: true },
 
   to:  { type: String, default: '' },
   cc:  { type: String, default: '' },
@@ -28,6 +30,12 @@ const emailSchema = new mongoose.Schema({
 
   active:    { type: Boolean, default: true },
   createdAt: { type: String,  default: () => new Date().toISOString() },
+});
+
+emailSchema.pre('save', function () {
+  const u = (this.userEmail || '').toString().trim();
+  this.userEmail = u;
+  this.userEmailLower = u ? u.toLowerCase() : '';
 });
 
 module.exports = mongoose.model("Email", emailSchema);

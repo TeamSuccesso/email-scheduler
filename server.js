@@ -334,6 +334,8 @@ app.post('/auth/disconnect', async (req, res) => {
 
 // ── Schedule / update an email ────────────────────────────────────────────────
 
+// ── Schedule / update an email ────────────────────────────────────────────────
+
 app.post('/schedule', async (req, res) => {
   try {
     const incoming = req.body;
@@ -347,11 +349,17 @@ app.post('/schedule', async (req, res) => {
 
     // If this schedule request came from the Chrome extension, treat Chrome as online immediately
     // so the cron job doesn't race and double-send before the first heartbeat tick.
+    incoming.userEmail = String(incoming.userEmail || '').trim();
+    incoming.userEmailLower = incoming.userEmail ? incoming.userEmail.toLowerCase() : '';
+
     if (incoming.fromChrome && incoming.userEmail) {
       chromeHeartbeat.set(incoming.userEmail, Date.now());
     }
 
     // ✅ FIX: Sanitize recipient fields — guard against [object Object] stored in old records
+    incoming.userEmail = String(incoming.userEmail || '').trim();
+    incoming.userEmailLower = incoming.userEmail ? incoming.userEmail.toLowerCase() : '';
+
     incoming.to  = sanitizeRecipient(incoming.to);
     incoming.cc  = sanitizeRecipient(incoming.cc);
     incoming.bcc = sanitizeRecipient(incoming.bcc);
@@ -359,34 +367,47 @@ app.post('/schedule', async (req, res) => {
     const existing = await Email.findOne({ id: incoming.id });
 
     if (existing) {
-      const wantsClear = incoming.clearAttachments === true;
-      const updateDoc = {
-        ...incoming,
-        sentCount: incoming.sentCount ?? existing.sentCount ?? 0,
-        lastSent: incoming.lastSent ?? existing.lastSent ?? null,
-      };
+        const wantsClear = incoming.clearAttachments === true;
+        
+        // ✅ FIX: Start with existing data to be safe
+        const updateDoc = { ...existing.toObject(), ...incoming };
 
-      if (!wantsClear) {
-        if (existing.attachments?.length && (!Array.isArray(incoming.attachments) || incoming.attachments.length === 0)) {
-          delete updateDoc.attachments;
-        }
-        if (existing.attachmentIds?.length && (!Array.isArray(incoming.attachmentIds) || incoming.attachmentIds.length === 0)) {
-          delete updateDoc.attachmentIds;
-        }
-      } else {
-        updateDoc.attachments = [];
-        updateDoc.attachmentIds = [];
-      }
+        // ✅ FIX: Explicitly handle sentCount/lastSent so they don't revert
+        updateDoc.sentCount = incoming.sentCount ?? existing.sentCount ?? 0;
+        updateDoc.lastSent = incoming.lastSent ?? existing.lastSent ?? null;
 
-            await Email.findOneAndUpdate(
-        { id: incoming.id },
-        updateDoc,
-        { returnDocument: 'after' }
-      );
-      console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(incoming.attachments || []).length}`);
+        // ✅ FIX: Attachment Preservation Logic
+        if (wantsClear) {
+          // User explicitly clicked "Clear Attachments"
+          updateDoc.attachments = [];
+          updateDoc.attachmentIds = [];
+        } else {
+          // If incoming data has attachments, use them.
+          // If incoming data has NO attachments (empty/undefined), keep OLD ones (don't delete them!).
+          const hasNewAttachments = Array.isArray(incoming.attachments) && incoming.attachments.length > 0;
+          if (!hasNewAttachments) {
+            // Preserve existing attachments from DB record
+            updateDoc.attachments = existing.attachments || [];
+            updateDoc.attachmentIds = existing.attachmentIds || [];
+            // Ensure we don't revert to empty if incoming payload had empty arrays
+            delete updateDoc.attachments; 
+            delete updateDoc.attachmentIds;
+          }
+        }
+
+        // Remove _id to prevent MongoDB errors on update
+        delete updateDoc._id;
+
+        await Email.findOneAndUpdate(
+          { id: incoming.id },
+          updateDoc,
+          { returnDocument: 'after' }
+        );
+        console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(updateDoc.attachments || existing.attachments || []).length}`);
     } else {
-      await Email.create(incoming);
-      console.log(`📅 New: "${incoming.subject}" → ${incoming.nextSendTime} | attachments: ${(incoming.attachments || []).length}`);
+        // ✅ FIX: MISSING ELSE BLOCK - This handles NEW emails
+        await Email.create(incoming);
+        console.log(`📅 New: "${incoming.subject}" → ${incoming.nextSendTime} | attachments: ${(incoming.attachments || []).length}`);
     }
 
     res.json({ ok: true });
@@ -617,9 +638,40 @@ app.post('/test-send', async (req, res) => {
 
 app.get('/emails', async (req, res) => {
   try {
-    const { userEmail } = req.query;
-    const filter = userEmail ? { userEmail } : {};
-    const emails = await Email.find(filter);
+    const userEmailRaw = (req.query?.userEmail || '').toString();
+    const userEmail = userEmailRaw.trim();
+    const userEmailLower = userEmail ? userEmail.toLowerCase() : '';
+    const filter = userEmail ? { $or: [{ userEmailLower }, { userEmail }] } : {};
+    // ✅ FIX: Select all fields EXCEPT 'attachments'. This makes the UI fast and responsive.
+    let emails = await Email.find(filter).select('-attachments');
+
+    if (userEmail && !emails.length) {
+      // Back-compat: case-insensitive match on userEmail field.
+      emails = await Email.find({ userEmail }).collation({ locale: 'en', strength: 2 }).select('-attachments');
+    }
+
+    if (userEmail && !emails.length) {
+      // Migration safety net: if the requester is the primary authenticated account,
+      // adopt any legacy rows with missing userEmail so they show up in the extension UI.
+      const primary = await getPrimaryUserEmail().catch(() => null);
+      if (primary && primary.toLowerCase() === userEmailLower) {
+        const unassignedFilter = {
+          $or: [
+            { userEmail: '' },
+            { userEmail: null },
+            { userEmailLower: '' },
+            { userEmailLower: null },
+            { userEmailLower: { $exists: false } },
+          ],
+        };
+        const unassignedCount = await Email.countDocuments(unassignedFilter);
+        if (unassignedCount > 0) {
+          await Email.updateMany(unassignedFilter, { userEmail: primary, userEmailLower });
+          emails = await Email.find({ $or: [{ userEmailLower }, { userEmail: primary }] }).select('-attachments');
+        }
+      }
+    }
+
     res.json(emails);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -642,6 +694,11 @@ app.delete('/schedule/:id', async (req, res) => {
 
 app.patch('/schedule/:id', async (req, res) => {
   try {
+    if (req.body && req.body.userEmail) {
+      const u = String(req.body.userEmail || '').trim();
+      req.body.userEmail = u;
+      req.body.userEmailLower = u ? u.toLowerCase() : '';
+    }
     const updated = await Email.findOneAndUpdate(
       { id: req.params.id },
       req.body,
@@ -809,15 +866,28 @@ async function sendEmailViaGmail(email) {
   const bccHeader = sanitizeRecipient(email.bcc);
   const fromHeader = sanitizeRecipient(email.from) || userEmail;
 
-  const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
-  const bodyType   = email.bodyType === 'html' ? 'html' : 'text';
-  const bodyContentType = bodyType === 'html' ? 'text/html' : 'text/plain';
-  const bodyContent = email.body || '';
-  const bodyB64    = chunkBase64Lines(Buffer.from(bodyContent, 'utf8').toString('base64'));
+ // ── FIX: Define Subject and Body ────────────────────────────────────────
+const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
 
-  const attachments = Array.isArray(email.attachments)
-    ? email.attachments.filter(a => a && a.dataBase64)
-    : [];
+const bodyType = email.bodyType === 'html' ? 'html' : 'text';
+const bodyContentType = bodyType === 'html' ? 'text/html' : 'text/plain';
+let bodyContent = String(email.body || '');
+
+// Force fallback if body is empty to solve "no content" issue
+// ✅ FIX: BLOCK EMPTY EMAILS
+if (!bodyContent || bodyContent.trim() === '') {
+    console.error('❌ ABORTING SEND: Email body is empty. Deleting this bad schedule.');
+    // Deactivate this specific email so it stops firing
+    deactivateEmail(email, 'empty_body_detected');
+    // Throw error to stop the process
+    throw new Error('Email body is empty. Please delete this schedule and create a new one.');
+}
+
+const bodyB64 = chunkBase64Lines(Buffer.from(bodyContent, 'utf8').toString('base64'));
+
+const attachments = Array.isArray(email.attachments)
+  ? email.attachments.filter(a => a && (a.dataBase64 || a.data))
+  : [];
 
   let mime;
 
@@ -834,7 +904,7 @@ async function sendEmailViaGmail(email) {
       'Content-Transfer-Encoding: base64',
       '',
       bodyB64,
-    ].filter(Boolean).join('\r\n');
+    ].filter(v => v !== null && v !== undefined).join('\r\n');
   } else {
     const parts = [
       `--${boundary}`,
@@ -842,21 +912,24 @@ async function sendEmailViaGmail(email) {
       'Content-Transfer-Encoding: base64',
       '',
       bodyB64,
+      '',
     ];
 
     for (const att of attachments) {
       const attName = (att.name || 'attachment').replace(/[\r\n"]/g, '');
       const attType = att.type || 'application/octet-stream';
-      let b64 = (att.dataBase64 || '').replace(/\r?\n/g, '');
+      let b64 = (att.dataBase64 || att.data || '').replace(/\r?\n/g, '');
       if (b64.includes('base64,')) b64 = b64.split('base64,').pop() || '';
       if (!b64) continue;
 
+      parts.push('');
       parts.push(`--${boundary}`);
       parts.push(`Content-Type: ${attType}; name="${attName}"`);
       parts.push(`Content-Disposition: attachment; filename="${attName}"`);
       parts.push('Content-Transfer-Encoding: base64');
       parts.push('');
       parts.push(chunkBase64Lines(b64));
+      parts.push('');
     }
     parts.push(`--${boundary}--`);
 
@@ -870,8 +943,9 @@ async function sendEmailViaGmail(email) {
       'MIME-Version: 1.0',
       `Content-Type: multipart/mixed; boundary="${boundary}"`,
       '',
+      '',
       ...parts,
-    ].filter(Boolean).join('\r\n');
+    ].filter(v => v !== null && v !== undefined).join('\r\n');
   }
 
   const raw = Buffer.from(mime, 'utf8')
