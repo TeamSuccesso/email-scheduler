@@ -16,10 +16,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Track whether the Chrome extension is currently online (prevents duplicate sends).
-// When Chrome is online, the server acts as backup only.
-const chromeHeartbeat = new Map(); // userEmail -> lastSeenMs
-const HEARTBEAT_TTL_MS = 2 * 60_000;
+const chromeHeartbeat = new Map();
 
 // ── Connect MongoDB ───────────────────────────────────────────────────────────
 
@@ -30,44 +27,35 @@ mongoose.connect(process.env.MONGO_URI)
     process.exit(1);
   });
 
-// ── Token storage (file-based) ────────────────────────────────────────────────
+// ── Token storage ─────────────────────────────────────────────────────────────
 
-const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+const TOKENS_FILE    = path.join(__dirname, 'tokens.json');
 const AUTH_META_FILE = path.join(__dirname, 'auth.json');
 
-let _tokensCache = null;
+let _tokensCache   = null;
 let _authMetaCache = null;
 
 function setTokensCache(next) {
   const normalized = (next && typeof next === 'object') ? next : {};
-  if (!_tokensCache) {
-    _tokensCache = normalized;
-    return _tokensCache;
-  }
+  if (!_tokensCache) { _tokensCache = normalized; return _tokensCache; }
   if (_tokensCache === normalized) return _tokensCache;
-
-  // Mutate in-place so any existing references keep seeing updates.
-  for (const k of Object.keys(_tokensCache)) {
-    if (!(k in normalized)) delete _tokensCache[k];
-  }
-  for (const [k, v] of Object.entries(normalized)) {
-    _tokensCache[k] = v;
-  }
+  for (const k of Object.keys(_tokensCache)) { if (!(k in normalized)) delete _tokensCache[k]; }
+  for (const [k, v] of Object.entries(normalized)) { _tokensCache[k] = v; }
   return _tokensCache;
 }
 
+// ── FIX: loadTokens ALWAYS reads from MongoDB on Vercel (serverless).
+// On serverless platforms, _tokensCache is null on every cold start.
+// Passing forceReload:true ensures we always get the real persisted data.
 async function loadTokens(opts = {}) {
   const forceReload = opts?.forceReload === true;
   if (_tokensCache && !forceReload) return _tokensCache;
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'tokens' }).lean();
-      if (doc?.value && typeof doc.value === 'object') {
-        return setTokensCache(doc.value);
-      }
+      if (doc?.value && typeof doc.value === 'object') return setTokensCache(doc.value);
     }
   } catch (_) {}
-  // Fallback: file-based
   if (!fs.existsSync(TOKENS_FILE)) return setTokensCache({});
   try { return setTokensCache(JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'))); }
   catch (_) { return setTokensCache({}); }
@@ -77,30 +65,18 @@ async function saveTokens(tokens) {
   setTokensCache(tokens);
   try {
     if (mongoose.connection.readyState === 1) {
-      await AuthState.findOneAndUpdate(
-        { key: 'tokens' },
-        { value: _tokensCache },
-        { upsert: true }
-      );
+      await AuthState.findOneAndUpdate({ key: 'tokens' }, { value: _tokensCache }, { upsert: true });
     }
   } catch (_) {}
-  // Best-effort mirror to file for local dev
   try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(_tokensCache, null, 2)); } catch (_) {}
 }
 
 function setAuthMetaCache(next) {
   const normalized = (next && typeof next === 'object') ? next : {};
-  if (!_authMetaCache) {
-    _authMetaCache = normalized;
-    return _authMetaCache;
-  }
+  if (!_authMetaCache) { _authMetaCache = normalized; return _authMetaCache; }
   if (_authMetaCache === normalized) return _authMetaCache;
-  for (const k of Object.keys(_authMetaCache)) {
-    if (!(k in normalized)) delete _authMetaCache[k];
-  }
-  for (const [k, v] of Object.entries(normalized)) {
-    _authMetaCache[k] = v;
-  }
+  for (const k of Object.keys(_authMetaCache)) { if (!(k in normalized)) delete _authMetaCache[k]; }
+  for (const [k, v] of Object.entries(normalized)) { _authMetaCache[k] = v; }
   return _authMetaCache;
 }
 
@@ -110,9 +86,7 @@ async function loadAuthMeta(opts = {}) {
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'meta' }).lean();
-      if (doc?.value && typeof doc.value === 'object') {
-        return setAuthMetaCache(doc.value);
-      }
+      if (doc?.value && typeof doc.value === 'object') return setAuthMetaCache(doc.value);
     }
   } catch (_) {}
   if (!fs.existsSync(AUTH_META_FILE)) return setAuthMetaCache({});
@@ -124,14 +98,32 @@ async function saveAuthMeta(meta) {
   setAuthMetaCache(meta);
   try {
     if (mongoose.connection.readyState === 1) {
-      await AuthState.findOneAndUpdate(
-        { key: 'meta' },
-        { value: _authMetaCache },
-        { upsert: true }
-      );
+      await AuthState.findOneAndUpdate({ key: 'meta' }, { value: _authMetaCache }, { upsert: true });
     }
   } catch (_) {}
   try { fs.writeFileSync(AUTH_META_FILE, JSON.stringify(_authMetaCache, null, 2)); } catch (_) {}
+}
+
+function getInstanceId(req) {
+  const id = (req.headers['x-instance-id'] || '').toString().trim();
+  return id || null;
+}
+
+async function getTokensForInstance(instanceId) {
+  if (!instanceId) return null;
+  // ── FIX: always forceReload so Vercel cold-start doesn't return null ──────
+  const allTokens = await loadTokens({ forceReload: true });
+  const entry = allTokens[instanceId];
+  if (entry && entry.tokens && entry.userEmail) return entry;
+  return null;
+}
+
+async function getUserEmailForInstance(instanceId) {
+  if (instanceId) {
+    const entry = await getTokensForInstance(instanceId);
+    if (entry?.userEmail) return entry.userEmail;
+  }
+  return getPrimaryUserEmail();
 }
 
 function listTokenEmails(tokens) {
@@ -139,20 +131,18 @@ function listTokenEmails(tokens) {
 }
 
 async function getPrimaryUserEmail() {
-  const allTokens = await loadTokens();
+  // ── FIX: always forceReload so Vercel cold-start doesn't return null ──────
+  const allTokens = await loadTokens({ forceReload: true });
   const emails = listTokenEmails(allTokens);
   if (!emails.length) return null;
-
-  const meta = await loadAuthMeta();
+  const meta = await loadAuthMeta({ forceReload: true });
   if (meta.lastConnectedEmail && allTokens[meta.lastConnectedEmail]) return meta.lastConnectedEmail;
   return emails[0];
 }
 
 // ── OAuth2 client ─────────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function isAccessTokenExpired(tokens, skewMs = 30_000) {
   const expiry = Number(tokens?.expiry_date);
@@ -162,34 +152,27 @@ function isAccessTokenExpired(tokens, skewMs = 30_000) {
 
 function extractGoogleApiError(err) {
   const status = err?.code || err?.response?.status || null;
-  const data = err?.response?.data;
+  const data   = err?.response?.data;
   const apiMsg = data?.error?.message || err?.message || 'Unknown Gmail API error';
-  const reason =
-    data?.error?.errors?.[0]?.reason ||
-    data?.error?.status ||
-    null;
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || null;
   return { status, apiMsg, reason, data };
 }
 
 class GmailSendError extends Error {
   constructor(message, opts = {}) {
     super(message);
-    this.name = 'GmailSendError';
-    this.httpStatus = opts.httpStatus || 500;
+    this.name         = 'GmailSendError';
+    this.httpStatus   = opts.httpStatus   || 500;
     this.googleStatus = opts.googleStatus || null;
     this.googleReason = opts.googleReason || null;
-    this.diagnostics = opts.diagnostics || null;
+    this.diagnostics  = opts.diagnostics  || null;
   }
 }
 
 async function deactivateEmail(email, reason) {
   try {
     if (!email?.id) return;
-    await Email.findOneAndUpdate(
-      { id: email.id },
-      { active: false, inFlightUntil: null },
-      { returnDocument: 'after' }
-    );
+    await Email.findOneAndUpdate({ id: email.id }, { active: false, inFlightUntil: null }, { returnDocument: 'after' });
     console.warn(`🔒 Deactivated email ${email.id}${reason ? ` (${reason})` : ''}`);
   } catch (_) {}
 }
@@ -214,27 +197,33 @@ app.get('/', async (req, res) => {
   }
 });
 
-// ── OAuth: get auth URL ───────────────────────────────────────────────────────
-
 app.get('/oauth/url', (req, res) => {
+  const instanceId = (req.query.instanceId || '').toString().trim();
+  if (!instanceId) {
+    return res.status(400).send('Missing instanceId. Please re-open the extension and try connecting again.');
+  }
+
   const oauth2 = makeOAuthClient();
   const url = oauth2.generateAuthUrl({
     access_type: 'offline',
     prompt:      'consent',
+    state:       instanceId,
     scope: [
       'https://www.googleapis.com/auth/gmail.send',
       'https://www.googleapis.com/auth/userinfo.email',
     ],
   });
-  // res.json({ url });
   res.redirect(url);
 });
 
-// ── OAuth: callback ───────────────────────────────────────────────────────────
-
 app.get('/oauth/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state: instanceId } = req.query;
   if (!code) return res.status(400).send('Missing code');
+
+  if (!instanceId) {
+    return res.status(400).send('Missing instanceId in OAuth state. Please try connecting again from the extension.');
+  }
+
   try {
     const oauth2 = makeOAuthClient();
     const { tokens } = await oauth2.getToken(code);
@@ -244,15 +233,25 @@ app.get('/oauth/callback', async (req, res) => {
     const { data }  = await oauth2Api.userinfo.get();
     const email     = data.email;
 
-    const allTokens  = await loadTokens();
-    if (allTokens[email]?.refresh_token && !tokens.refresh_token) {
-      tokens.refresh_token = allTokens[email].refresh_token;
-    }
-    allTokens[email] = tokens;
-    await saveTokens(allTokens);
-    await saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
+    // ── FIX: forceReload so we don't overwrite other instances' tokens ────────
+    const allTokens = await loadTokens({ forceReload: true });
 
-    console.log(`✅ Tokens saved for ${email}`);
+    const existingEntry = allTokens[instanceId] || {};
+    const existingTokens = existingEntry.tokens || {};
+    if (existingTokens.refresh_token && !tokens.refresh_token) {
+      tokens.refresh_token = existingTokens.refresh_token;
+    }
+
+    allTokens[instanceId] = { userEmail: email, tokens };
+
+    await saveTokens(allTokens);
+
+    // ── FIX: forceReload meta too ─────────────────────────────────────────────
+    const meta = await loadAuthMeta({ forceReload: true });
+    meta[instanceId] = { lastConnectedEmail: email, connectedAt: new Date().toISOString() };
+    await saveAuthMeta(meta);
+
+    console.log(`✅ Tokens saved for ${email} (instance: ${instanceId})`);
     res.send(`
       <html><body style="font-family:sans-serif;text-align:center;padding:40px;">
         <h2>✅ Connected!</h2>
@@ -266,51 +265,100 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
-// ── Save token from extension ─────────────────────────────────────────────────
-
 app.post('/oauth/token', async (req, res) => {
   const { email, tokens } = req.body;
   if (!email || !tokens) return res.status(400).json({ error: 'Missing email or tokens' });
 
-  const allTokens = await loadTokens();
-  const existing  = allTokens[email] || {};
+  const instanceId = getInstanceId(req);
 
-  const merged = {
-    ...existing,
-    ...tokens,
-    refresh_token: tokens.refresh_token || existing.refresh_token || null,
-  };
+  // ── FIX: forceReload so we don't lose other instances on cold start ────────
+  const allTokens = await loadTokens({ forceReload: true });
 
-  if (!merged.refresh_token) {
-    console.warn(`⚠️  No refresh_token for ${email} — server sending may fail after token expiry`);
+  if (instanceId) {
+    const existingEntry  = allTokens[instanceId] || {};
+    const existingTokens = existingEntry.tokens  || {};
+    const merged = {
+      ...existingTokens,
+      ...tokens,
+      refresh_token: tokens.refresh_token || existingTokens.refresh_token || null,
+    };
+    if (!merged.refresh_token) {
+      console.warn(`⚠️  No refresh_token for ${email} (instance: ${instanceId}) — server sending may fail after token expiry`);
+    }
+    allTokens[instanceId] = { userEmail: email, tokens: merged };
+    await saveTokens(allTokens);
+
+    const meta = await loadAuthMeta({ forceReload: true });
+    meta[instanceId] = { lastConnectedEmail: email, connectedAt: new Date().toISOString() };
+    await saveAuthMeta(meta);
+
+    console.log(`💾 Token updated for ${email} (instance: ${instanceId}, has refresh: ${!!merged.refresh_token})`);
+  } else {
+    const existing = allTokens[email] || {};
+    const merged = {
+      ...existing,
+      ...tokens,
+      refresh_token: tokens.refresh_token || existing.refresh_token || null,
+    };
+    allTokens[email] = merged;
+    await saveTokens(allTokens);
+    await saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
+    console.log(`💾 Token updated for ${email} (legacy flat, has refresh: ${!!merged.refresh_token})`);
   }
 
-  allTokens[email] = merged;
-  await saveTokens(allTokens);
-  await saveAuthMeta({ lastConnectedEmail: email, connectedAt: new Date().toISOString() });
-  console.log(`💾 Token updated for ${email} (has refresh: ${!!merged.refresh_token})`);
   res.json({ ok: true });
 });
 
-// ── Auth status (used by Chrome extension UI) ────────────────────────────────
+// ── FIX: /auth/status — always force-reload from MongoDB ─────────────────────
+// WHY: On Vercel (serverless), every request may start a fresh Node process.
+// _tokensCache is always null on cold start, so without forceReload the server
+// always returns { connected: false } — making the extension show "Not connected"
+// every time Chrome restarts, even though the user already authenticated.
+// FIX: Always read from MongoDB here so the real persisted auth is returned.
+app.get('/auth/status', async (req, res) => {
+  try {
+    const instanceId = getInstanceId(req);
 
-app.get('/auth/status', (req, res) => {
-  getPrimaryUserEmail()
-    .then(email => res.json({ connected: !!email, email: email || null }))
-    .catch(err => res.status(500).json({ connected: false, email: null, error: err.message }));
+    if (instanceId) {
+      // forceReload: true — never trust the empty in-memory cache on serverless
+      const allTokens = await loadTokens({ forceReload: true });
+      const entry = allTokens[instanceId];
+      if (entry?.userEmail && entry?.tokens) {
+        return res.json({ connected: true, email: entry.userEmail });
+      }
+      return res.json({ connected: false, email: null });
+    }
+
+    const email = await getPrimaryUserEmail();
+    res.json({ connected: !!email, email: email || null });
+  } catch (err) {
+    res.status(500).json({ connected: false, email: null, error: err.message });
+  }
 });
 
-// Optional: Disconnect (delete stored tokens)
 app.post('/auth/disconnect', async (req, res) => {
   try {
-    const allTokens = await loadTokens();
+    // ── FIX: forceReload so we don't accidentally clear only a partial set ───
+    const allTokens = await loadTokens({ forceReload: true });
     const email = (req.body?.email || '').toString().trim();
-    const mode = (req.body?.mode || '').toString().trim(); // "all" or ""
+    const mode  = (req.body?.mode  || '').toString().trim();
 
     if (mode === 'all') {
       for (const k of Object.keys(allTokens)) delete allTokens[k];
       await saveTokens(allTokens);
       await saveAuthMeta({});
+      return res.json({ ok: true });
+    }
+
+    if (mode === 'instance') {
+      const instanceId = getInstanceId(req);
+      if (instanceId && allTokens[instanceId]) {
+        delete allTokens[instanceId];
+        await saveTokens(allTokens);
+        const meta = await loadAuthMeta({ forceReload: true });
+        delete meta[instanceId];
+        await saveAuthMeta(meta);
+      }
       return res.json({ ok: true });
     }
 
@@ -322,8 +370,10 @@ app.post('/auth/disconnect', async (req, res) => {
     const remaining = listTokenEmails(await loadTokens());
     if (!remaining.length) await saveAuthMeta({});
     else {
-      const meta = await loadAuthMeta();
-      if (meta.lastConnectedEmail === email) await saveAuthMeta({ lastConnectedEmail: remaining[0], connectedAt: new Date().toISOString() });
+      const meta = await loadAuthMeta({ forceReload: true });
+      if (meta.lastConnectedEmail === email) {
+        await saveAuthMeta({ lastConnectedEmail: remaining[0], connectedAt: new Date().toISOString() });
+      }
     }
 
     res.json({ ok: true });
@@ -334,31 +384,25 @@ app.post('/auth/disconnect', async (req, res) => {
 
 // ── Schedule / update an email ────────────────────────────────────────────────
 
-// ── Schedule / update an email ────────────────────────────────────────────────
-
 app.post('/schedule', async (req, res) => {
   try {
-    const incoming = req.body;
+    const incoming   = req.body;
+    const instanceId = getInstanceId(req);
+
     if (!incoming || !incoming.id) return res.status(400).json({ error: 'Invalid email data' });
 
     if (!incoming.userEmail) {
-      const primary = await getPrimaryUserEmail();
-      if (primary) incoming.userEmail = primary;
+      const resolvedEmail = await getUserEmailForInstance(instanceId);
+      if (resolvedEmail) incoming.userEmail = resolvedEmail;
       else return res.status(400).json({ error: 'No authenticated user — cannot schedule email' });
     }
 
-    // If this schedule request came from the Chrome extension, treat Chrome as online immediately
-    // so the cron job doesn't race and double-send before the first heartbeat tick.
-    incoming.userEmail = String(incoming.userEmail || '').trim();
+    incoming.userEmail      = String(incoming.userEmail || '').trim();
     incoming.userEmailLower = incoming.userEmail ? incoming.userEmail.toLowerCase() : '';
 
     if (incoming.fromChrome && incoming.userEmail) {
       chromeHeartbeat.set(incoming.userEmail, Date.now());
     }
-
-    // ✅ FIX: Sanitize recipient fields — guard against [object Object] stored in old records
-    incoming.userEmail = String(incoming.userEmail || '').trim();
-    incoming.userEmailLower = incoming.userEmail ? incoming.userEmail.toLowerCase() : '';
 
     incoming.to  = sanitizeRecipient(incoming.to);
     incoming.cc  = sanitizeRecipient(incoming.cc);
@@ -366,48 +410,47 @@ app.post('/schedule', async (req, res) => {
 
     const existing = await Email.findOne({ id: incoming.id });
 
+    if (existing && incoming.fromChrome) {
+      const serverLastSentMs = existing.lastSent     ? new Date(existing.lastSent).getTime()     : 0;
+      const chromeLastSentMs = incoming.lastSent     ? new Date(incoming.lastSent).getTime()     : 0;
+      const serverNextSendMs = existing.nextSendTime ? new Date(existing.nextSendTime).getTime() : 0;
+      const chromeNextSendMs = incoming.nextSendTime ? new Date(incoming.nextSendTime).getTime() : 0;
+      const nowMs            = Date.now();
+
+      if (serverLastSentMs >= chromeLastSentMs) {
+        delete incoming.nextSendTime;
+        delete incoming.lastSent;
+        delete incoming.sentCount;
+      } else if (incoming.nextSendTime && chromeNextSendMs < nowMs && serverNextSendMs > nowMs) {
+        delete incoming.nextSendTime;
+      }
+    }
+
     if (existing) {
-        const wantsClear = incoming.clearAttachments === true;
-        
-        // ✅ FIX: Start with existing data to be safe
-        const updateDoc = { ...existing.toObject(), ...incoming };
+      const wantsClear = incoming.clearAttachments === true;
+      const updateDoc  = { ...existing.toObject(), ...incoming };
 
-        // ✅ FIX: Explicitly handle sentCount/lastSent so they don't revert
-        updateDoc.sentCount = incoming.sentCount ?? existing.sentCount ?? 0;
-        updateDoc.lastSent = incoming.lastSent ?? existing.lastSent ?? null;
+      updateDoc.sentCount = incoming.sentCount ?? existing.sentCount ?? 0;
+      updateDoc.lastSent  = incoming.lastSent  ?? existing.lastSent  ?? null;
 
-        // ✅ FIX: Attachment Preservation Logic
-        if (wantsClear) {
-          // User explicitly clicked "Clear Attachments"
-          updateDoc.attachments = [];
-          updateDoc.attachmentIds = [];
-        } else {
-          // If incoming data has attachments, use them.
-          // If incoming data has NO attachments (empty/undefined), keep OLD ones (don't delete them!).
-          const hasNewAttachments = Array.isArray(incoming.attachments) && incoming.attachments.length > 0;
-          if (!hasNewAttachments) {
-            // Preserve existing attachments from DB record
-            updateDoc.attachments = existing.attachments || [];
-            updateDoc.attachmentIds = existing.attachmentIds || [];
-            // Ensure we don't revert to empty if incoming payload had empty arrays
-            delete updateDoc.attachments; 
-            delete updateDoc.attachmentIds;
-          }
+      if (wantsClear) {
+        updateDoc.attachments   = [];
+        updateDoc.attachmentIds = [];
+      } else {
+        const hasNewAttachments = Array.isArray(incoming.attachments) && incoming.attachments.length > 0;
+        if (!hasNewAttachments) {
+          delete updateDoc.attachments;
+          delete updateDoc.attachmentIds;
         }
+      }
 
-        // Remove _id to prevent MongoDB errors on update
-        delete updateDoc._id;
+      delete updateDoc._id;
 
-        await Email.findOneAndUpdate(
-          { id: incoming.id },
-          updateDoc,
-          { returnDocument: 'after' }
-        );
-        console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(updateDoc.attachments || existing.attachments || []).length}`);
+      await Email.findOneAndUpdate({ id: incoming.id }, updateDoc, { returnDocument: 'after' });
+      console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(updateDoc.attachments || existing.attachments || []).length}`);
     } else {
-        // ✅ FIX: MISSING ELSE BLOCK - This handles NEW emails
-        await Email.create(incoming);
-        console.log(`📅 New: "${incoming.subject}" → ${incoming.nextSendTime} | attachments: ${(incoming.attachments || []).length}`);
+      await Email.create(incoming);
+      console.log(`📅 New: "${incoming.subject}" → ${incoming.nextSendTime} | attachments: ${(incoming.attachments || []).length}`);
     }
 
     res.json({ ok: true });
@@ -417,18 +460,18 @@ app.post('/schedule', async (req, res) => {
   }
 });
 
-// ── Send now (used by Chrome extension when Chrome is open) ──────────────────
-
 app.post('/send-now', async (req, res) => {
   let emailIdForUnlock = null;
   try {
-    const incoming = req.body?.email || req.body;
+    const incoming   = req.body?.email || req.body;
+    const instanceId = getInstanceId(req);
+
     if (!incoming || !incoming.id) return res.status(400).json({ ok: false, error: 'Invalid email data' });
     emailIdForUnlock = incoming.id;
 
     if (!incoming.userEmail) {
-      const primary = await getPrimaryUserEmail();
-      if (primary) incoming.userEmail = primary;
+      const resolvedEmail = await getUserEmailForInstance(instanceId);
+      if (resolvedEmail) incoming.userEmail = resolvedEmail;
       else return res.status(400).json({ ok: false, error: 'No authenticated user' });
     }
 
@@ -437,14 +480,12 @@ app.post('/send-now', async (req, res) => {
     incoming.bcc = sanitizeRecipient(incoming.bcc);
 
     const existing = await Email.findOne({ id: incoming.id });
-    const merged = existing ? { ...existing.toObject(), ...incoming } : incoming;
+    const merged   = existing ? { ...existing.toObject(), ...incoming } : incoming;
 
-    // If attachments were not included in this request, keep stored attachments.
     if ((!Array.isArray(merged.attachments) || merged.attachments.length === 0) && existing?.attachments?.length) {
       merged.attachments = existing.attachments;
     }
 
-    // Persist latest payload before acquiring lock (do not overwrite lock fields here)
     const mergedToStore = { ...merged };
     delete mergedToStore.inFlightUntil;
     await Email.findOneAndUpdate({ id: merged.id }, mergedToStore, { upsert: true });
@@ -453,98 +494,79 @@ app.post('/send-now', async (req, res) => {
     if (!locked) {
       const current = await Email.findOne({ id: merged.id });
       return res.status(409).json({
-        ok: false,
-        inProgress: true,
-        retryAfterMs: 30_000,
+        ok: false, inProgress: true, retryAfterMs: 30_000,
         email: stripEmailPayload(current),
         error: 'Email is already sending. Please try again in a moment.',
       });
     }
 
-    await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked);
+    await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked, instanceId);
 
-    const now = new Date();
+    const now          = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
     const isOnce       = merged.recurrence?.once === true || merged.type === 'once';
     const reachedMax   = merged.maxTimes !== 'indefinitely' && newSentCount >= parseInt(merged.maxTimes);
     const isDone       = isOnce || reachedMax;
-
     const nextSendTime = isDone ? null : computeNextSendTime(merged);
 
     const updated = await Email.findOneAndUpdate(
       { id: merged.id },
-      {
-        sentCount: newSentCount,
-        lastSent: now.toISOString(),
-        active: isDone ? false : merged.active,
-        nextSendTime,
-        inFlightUntil: null,
-      },
+      { sentCount: newSentCount, lastSent: now.toISOString(), active: isDone ? false : merged.active, nextSendTime, inFlightUntil: null },
       { returnDocument: 'after' }
     );
 
     res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
-    const status = (err && typeof err === 'object' && Number.isFinite(err.httpStatus))
-      ? err.httpStatus
-      : 500;
+    const status = (err && typeof err === 'object' && Number.isFinite(err.httpStatus)) ? err.httpStatus : 500;
     res.status(status).json({ ok: false, error: err?.message || String(err || 'Unknown error') });
   } finally {
     try { await releaseSendLock(emailIdForUnlock); } catch (_) {}
   }
 });
 
-// ── Get emails for a user ─────────────────────────────────────────────────────
+// ── Diagnostic test-send ──────────────────────────────────────────────────────
 
-// Diagnostic endpoint for debugging Gmail API auth/sending
-// POST /test-send { userEmail: "..." }
 app.post('/test-send', async (req, res) => {
   const requestedEmail = (req.body?.userEmail || '').toString().trim() || null;
-  const diagnostics = {
-    requestedEmail,
-    resolvedUserEmail: null,
-    token: null,
-    tokenInfo: null,
-    profile: null,
-    send: null,
-    gmailError: null,
-  };
+  const instanceId     = getInstanceId(req);
+  const diagnostics    = { requestedEmail, resolvedUserEmail: null, token: null, tokenInfo: null, profile: null, send: null, gmailError: null };
 
   try {
-    console.log('[test-send] start', { requestedEmail });
+    console.log('[test-send] start', { requestedEmail, instanceId });
 
-    const allTokens = await loadTokens();
-    const userEmail = requestedEmail || await getPrimaryUserEmail() || Object.keys(allTokens)[0];
+    // ── FIX: forceReload so cold-start serverless doesn't return empty tokens ─
+    const allTokens = await loadTokens({ forceReload: true });
+
+    let userEmail, tokens;
+    if (instanceId && allTokens[instanceId]) {
+      userEmail = allTokens[instanceId].userEmail;
+      tokens    = allTokens[instanceId].tokens;
+    } else {
+      userEmail = requestedEmail || await getPrimaryUserEmail() || Object.keys(allTokens).find(k => k.includes('@'));
+      tokens    = userEmail ? allTokens[userEmail] : null;
+    }
+
     diagnostics.resolvedUserEmail = userEmail || null;
     if (!userEmail) return res.status(400).json({ ok: false, error: 'No authenticated user found', diagnostics });
-
-    const tokens = allTokens[userEmail];
-    if (!tokens) return res.status(404).json({ ok: false, error: `No tokens for ${userEmail}`, diagnostics });
+    if (!tokens)    return res.status(404).json({ ok: false, error: `No tokens for ${userEmail}`, diagnostics });
 
     diagnostics.token = {
-      hasAccessToken: !!tokens.access_token,
+      hasAccessToken:  !!tokens.access_token,
       hasRefreshToken: !!tokens.refresh_token,
-      expiry_date: tokens.expiry_date || null,
-      isExpired: isAccessTokenExpired(tokens),
+      expiry_date:     tokens.expiry_date || null,
+      isExpired:       isAccessTokenExpired(tokens),
     };
-    console.log('[test-send] token loaded', diagnostics.token);
 
     const oauth2 = makeOAuthClient();
     oauth2.setCredentials(tokens);
-    console.log('[test-send] credentials set');
 
     if (tokens.access_token) {
       try {
         const info = await oauth2.getTokenInfo(tokens.access_token);
-        diagnostics.tokenInfo = {
-          expires_in: info?.expires_in ?? null,
-          scope: info?.scope ?? null,
-        };
+        diagnostics.tokenInfo = { expires_in: info?.expires_in ?? null, scope: info?.scope ?? null };
         diagnostics.tokenInfo.hasGmailSendScope = String(info?.scope || '').includes('gmail.send');
-        console.log('[test-send] tokenInfo', diagnostics.tokenInfo);
       } catch (e) {
         diagnostics.tokenInfo = { error: String(e?.message || e) };
-        console.warn('[test-send] tokenInfo failed', diagnostics.tokenInfo);
       }
     }
 
@@ -553,114 +575,84 @@ app.post('/test-send', async (req, res) => {
     try {
       const prof = await gmail.users.getProfile({ userId: 'me' });
       diagnostics.profile = { emailAddress: prof?.data?.emailAddress || null };
-      diagnostics.profile.mismatch = !!(
-        diagnostics.profile.emailAddress &&
-        diagnostics.profile.emailAddress.toLowerCase() !== String(userEmail).toLowerCase()
-      );
-      console.log('[test-send] profile', diagnostics.profile);
+      diagnostics.profile.mismatch = !!(diagnostics.profile.emailAddress && diagnostics.profile.emailAddress.toLowerCase() !== String(userEmail).toLowerCase());
     } catch (e) {
       diagnostics.profile = { error: String(e?.message || e) };
-      console.warn('[test-send] profile failed', diagnostics.profile);
     }
 
-    const subject = `Test send ${new Date().toISOString()}`;
+    const subject    = `Test send ${new Date().toISOString()}`;
     const subjectB64 = Buffer.from(subject, 'utf8').toString('base64');
-    const body = `Test email sent at ${new Date().toISOString()} from Recurring Gmail server.`;
-    const bodyB64 = chunkBase64Lines(Buffer.from(body, 'utf8').toString('base64'));
+    const body       = `Test email sent at ${new Date().toISOString()} from Recurring Gmail server.`;
+    const bodyB64    = chunkBase64Lines(Buffer.from(body, 'utf8').toString('base64'));
     const mime = [
-      `From: ${userEmail}`,
-      `To: ${userEmail}`,
+      `From: ${userEmail}`, `To: ${userEmail}`,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       `Date: ${new Date().toUTCString()}`,
-      'MIME-Version: 1.0',
-      'Content-Type: text/plain; charset=UTF-8',
-      'Content-Transfer-Encoding: base64',
-      '',
-      bodyB64,
+      'MIME-Version: 1.0', 'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64', '', bodyB64,
     ].join('\r\n');
 
-    const raw = Buffer.from(mime, 'utf8')
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
-    console.log('[test-send] sending…');
+    const raw = Buffer.from(mime, 'utf8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
     const delays = [2000, 4000, 8000];
-    let lastErr = null;
-    let responseData = null;
-
+    let lastErr = null, responseData = null;
     for (let attempt = 0; attempt < (delays.length + 1); attempt++) {
       try {
         const resp = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
-        responseData = resp?.data || null;
-        lastErr = null;
-        break;
+        responseData = resp?.data || null; lastErr = null; break;
       } catch (e) {
         lastErr = e;
         const { status, apiMsg } = extractGoogleApiError(e);
         const retryable = Number.isFinite(status) && status >= 500 && status < 600;
-        if (retryable && attempt < delays.length) {
-          const waitMs = delays[attempt];
-          console.warn(`[test-send] Gmail 5xx (${status}). Retry ${attempt + 1}/${delays.length} in ${waitMs}ms: ${apiMsg}`);
-          await sleep(waitMs);
-          continue;
-        }
+        if (retryable && attempt < delays.length) { await sleep(delays[attempt]); continue; }
         break;
       }
     }
 
     if (lastErr) {
       const { status, apiMsg, reason, data } = extractGoogleApiError(lastErr);
-      diagnostics.gmailError = {
-        status: status || null,
-        reason: reason || null,
-        message: apiMsg,
-        raw: data?.error || data || null,
-      };
-      console.error('[test-send] failed', diagnostics.gmailError);
-      return res.status(Number.isFinite(status) ? status : 500).json({
-        ok: false,
-        error: `Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}`,
-        diagnostics,
-      });
+      diagnostics.gmailError = { status: status || null, reason: reason || null, message: apiMsg, raw: data?.error || data || null };
+      return res.status(Number.isFinite(status) ? status : 500).json({ ok: false, error: `Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}`, diagnostics });
     }
 
     diagnostics.send = { ok: true, response: responseData };
-    console.log('[test-send] success', responseData);
     return res.json({ ok: true, diagnostics });
   } catch (err) {
-    console.error('[test-send] unexpected error', err);
     return res.status(500).json({ ok: false, error: err?.message || String(err || 'Unknown error'), diagnostics });
   }
 });
 
+// ── Get emails for a user ─────────────────────────────────────────────────────
+
 app.get('/emails', async (req, res) => {
   try {
-    const userEmailRaw = (req.query?.userEmail || '').toString();
-    const userEmail = userEmailRaw.trim();
+    const instanceId    = getInstanceId(req);
+    const userEmailRaw  = (req.query?.userEmail || '').toString();
+    let   userEmail     = userEmailRaw.trim();
+
+    if (!userEmail && instanceId) {
+      // ── FIX: forceReload for same cold-start reason ───────────────────────
+      const allTokens = await loadTokens({ forceReload: true });
+      const entry = allTokens[instanceId];
+      if (entry?.userEmail) userEmail = entry.userEmail;
+    }
+
     const userEmailLower = userEmail ? userEmail.toLowerCase() : '';
     const filter = userEmail ? { $or: [{ userEmailLower }, { userEmail }] } : {};
-    // ✅ FIX: Select all fields EXCEPT 'attachments'. This makes the UI fast and responsive.
+
     let emails = await Email.find(filter).select('-attachments');
 
     if (userEmail && !emails.length) {
-      // Back-compat: case-insensitive match on userEmail field.
       emails = await Email.find({ userEmail }).collation({ locale: 'en', strength: 2 }).select('-attachments');
     }
 
     if (userEmail && !emails.length) {
-      // Migration safety net: if the requester is the primary authenticated account,
-      // adopt any legacy rows with missing userEmail so they show up in the extension UI.
       const primary = await getPrimaryUserEmail().catch(() => null);
       if (primary && primary.toLowerCase() === userEmailLower) {
         const unassignedFilter = {
           $or: [
-            { userEmail: '' },
-            { userEmail: null },
-            { userEmailLower: '' },
-            { userEmailLower: null },
+            { userEmail: '' }, { userEmail: null },
+            { userEmailLower: '' }, { userEmailLower: null },
             { userEmailLower: { $exists: false } },
           ],
         };
@@ -696,14 +688,10 @@ app.patch('/schedule/:id', async (req, res) => {
   try {
     if (req.body && req.body.userEmail) {
       const u = String(req.body.userEmail || '').trim();
-      req.body.userEmail = u;
+      req.body.userEmail      = u;
       req.body.userEmailLower = u ? u.toLowerCase() : '';
     }
-    const updated = await Email.findOneAndUpdate(
-      { id: req.params.id },
-      req.body,
-      { new: true }
-    );
+    const updated = await Email.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
     if (!updated) return res.status(404).json({ error: 'Not found' });
     res.json({ ok: true, email: stripEmailPayload(updated) });
   } catch (err) {
@@ -713,7 +701,6 @@ app.patch('/schedule/:id', async (req, res) => {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ✅ FIX: Sanitize recipient — converts arrays/objects to plain string, strips [object Object]
 function sanitizeRecipient(val) {
   if (!val) return '';
   if (Array.isArray(val)) return val.map(v => (typeof v === 'string' ? v : v?.email || v?.address || '')).filter(Boolean).join(',');
@@ -724,25 +711,18 @@ function sanitizeRecipient(val) {
 function stripEmailPayload(emailDoc) {
   if (!emailDoc) return emailDoc;
   const obj = typeof emailDoc.toObject === 'function' ? emailDoc.toObject() : { ...emailDoc };
-  delete obj.attachments; // can be very large (base64)
+  delete obj.attachments;
   return obj;
 }
 
 async function tryAcquireSendLock(emailId, lockMs = 2 * 60_000) {
   const nowIso   = new Date().toISOString();
   const untilIso = new Date(Date.now() + lockMs).toISOString();
-  const doc = await Email.findOneAndUpdate(
-    {
-      id: emailId,
-      $or: [
-        { inFlightUntil: null },
-        { inFlightUntil: { $lt: nowIso } },
-      ],
-    },
+  return Email.findOneAndUpdate(
+    { id: emailId, $or: [{ inFlightUntil: null }, { inFlightUntil: { $lt: nowIso } }] },
     { inFlightUntil: untilIso },
     { returnDocument: 'after' }
   );
-  return doc;
 }
 
 async function releaseSendLock(emailId) {
@@ -752,13 +732,17 @@ async function releaseSendLock(emailId) {
 
 function isEmailDone(email) {
   const isOnce     = email.recurrence?.once === true || email.type === 'once';
-  const reachedMax = email.maxTimes !== 'indefinitely' &&
-                     (email.sentCount || 0) >= parseInt(email.maxTimes);
+  const reachedMax = email.maxTimes !== 'indefinitely' && (email.sentCount || 0) >= parseInt(email.maxTimes);
   return !email.active || (isOnce && (email.sentCount || 0) >= 1) || reachedMax;
 }
 
+function makeDateAt(year, month, day, h, m) {
+  const d = new Date(year, month, day, h, m, 0, 0);
+  return d;
+}
+
 function computeNextSendTime(email) {
-  const r   = email.recurrence || {};
+  const r = email.recurrence || {};
   const now = new Date();
   const [h, m] = (email.time || '08:00').split(':').map(Number);
 
@@ -770,74 +754,64 @@ function computeNextSendTime(email) {
 
   if (r.weeks) {
     const targetDay = typeof r.dayOfWeek === 'number' ? r.dayOfWeek : 1;
-    const next = new Date(now);
-    next.setHours(h, m, 0, 0);
+    const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
     let daysUntil = (targetDay - now.getDay() + 7) % 7;
-    if (daysUntil === 0 && next <= now) daysUntil = 7;
-    next.setDate(next.getDate() + daysUntil);
-    return next.toISOString();
+    if (daysUntil === 0 && candidate <= now) daysUntil = 7;
+    candidate.setDate(candidate.getDate() + daysUntil);
+    return candidate.toISOString();
   }
 
   if (r.days) {
-    const next = new Date(now);
-    next.setDate(next.getDate() + r.days);
-    next.setHours(h, m, 0, 0);
-    return next.toISOString();
+    const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+    if (candidate <= now) candidate.setDate(candidate.getDate() + r.days);
+    return candidate.toISOString();
   }
 
   if (r.months) {
-    const fallbackFromNext = email.nextSendTime ? new Date(email.nextSendTime).getDate() : now.getDate();
-    const targetDay = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : fallbackFromNext;
-    const next = new Date(now);
-    next.setHours(h, m, 0, 0);
-    next.setDate(1);
-    next.setMonth(next.getMonth() + r.months);
-    const dim = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate();
-    next.setDate(Math.min(Math.max(1, targetDay), dim));
-    return next.toISOString();
+    const targetDOM = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : now.getDate();
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + r.months, 1);
+    const daysInMonth = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
+    const clampedDay  = Math.min(Math.max(1, targetDOM), daysInMonth);
+    const candidate   = makeDateAt(nextMonth.getFullYear(), nextMonth.getMonth(), clampedDay, h, m);
+    return candidate.toISOString();
   }
 
-  const next = new Date(now);
-  next.setDate(next.getDate() + 1);
-  next.setHours(h, m, 0, 0);
-  return next.toISOString();
+  const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+  if (candidate <= now) candidate.setDate(candidate.getDate() + 1);
+  return candidate.toISOString();
 }
-
-// ── Send email via Gmail API ──────────────────────────────────────────────────
 
 function chunkBase64Lines(b64, lineLen = 76) {
   const s = String(b64 || '').replace(/\r?\n/g, '');
   if (!s) return '';
   let out = '';
-  for (let i = 0; i < s.length; i += lineLen) {
-    out += s.slice(i, i + lineLen) + '\r\n';
-  }
+  for (let i = 0; i < s.length; i += lineLen) out += s.slice(i, i + lineLen) + '\r\n';
   return out.replace(/\r\n$/, '');
 }
 
-async function sendEmailViaGmail(email) {
-  // ✅ FIX: Sanitize recipient at send time to catch any corrupted DB records
+async function sendEmailViaGmail(email, instanceId = null) {
   const toStr = sanitizeRecipient(email.to);
-  if (!toStr || toStr === '[object Object]') {
-    throw new Error('Recipient address required');
+  if (!toStr || toStr === '[object Object]') throw new Error('Recipient address required');
+
+  // ── FIX: forceReload so we get real tokens on serverless cold start ────────
+  const allTokens = await loadTokens({ forceReload: true });
+
+  let userEmail, tokens;
+
+  if (instanceId && allTokens[instanceId]) {
+    userEmail = allTokens[instanceId].userEmail;
+    tokens    = allTokens[instanceId].tokens;
+  } else {
+    userEmail = email.userEmail || await getPrimaryUserEmail() || Object.keys(allTokens).find(k => k.includes('@'));
+    tokens    = userEmail ? allTokens[userEmail] : null;
   }
 
-  const allTokens = await loadTokens();
-  const userEmail = email.userEmail || await getPrimaryUserEmail() || Object.keys(allTokens)[0];
   if (!userEmail) throw new Error('No authenticated user found');
-
-  const tokens = allTokens[userEmail];
-  if (!tokens) throw new Error(`No tokens for ${userEmail}`);
+  if (!tokens)    throw new Error(`No tokens for ${userEmail}`);
 
   const isExpired = isAccessTokenExpired(tokens);
   if (isExpired && !tokens.refresh_token) {
     const msg = 'Token expired and no refresh_token available. Please reconnect via /oauth/url';
-    console.error(msg, {
-      userEmail,
-      expiry_date: tokens.expiry_date || null,
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: false,
-    });
     await deactivateEmail(email, 'token_expired_no_refresh');
     throw new GmailSendError(msg, { httpStatus: 401, diagnostics: { userEmail, expiry_date: tokens.expiry_date || null } });
   }
@@ -851,69 +825,53 @@ async function sendEmailViaGmail(email) {
 
   oauth2.on('tokens', (newTokens) => {
     if (newTokens.refresh_token) tokens.refresh_token = newTokens.refresh_token;
-    if (newTokens.access_token) tokens.access_token = newTokens.access_token;
-    if (newTokens.expiry_date) tokens.expiry_date  = newTokens.expiry_date;
-    allTokens[userEmail] = tokens;
+    if (newTokens.access_token)  tokens.access_token  = newTokens.access_token;
+    if (newTokens.expiry_date)   tokens.expiry_date   = newTokens.expiry_date;
+    if (instanceId && allTokens[instanceId]) {
+      allTokens[instanceId].tokens = tokens;
+    } else {
+      allTokens[userEmail] = tokens;
+    }
     void saveTokens(allTokens);
     console.log(`🔄 Token refreshed for ${userEmail}`);
   });
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2 });
 
-  const boundary  = `boundary_${Date.now()}`;
-  const toHeader  = toStr;
-  const ccHeader  = sanitizeRecipient(email.cc);
-  const bccHeader = sanitizeRecipient(email.bcc);
+  const boundary   = `boundary_${Date.now()}`;
+  const toHeader   = toStr;
+  const ccHeader   = sanitizeRecipient(email.cc);
+  const bccHeader  = sanitizeRecipient(email.bcc);
   const fromHeader = sanitizeRecipient(email.from) || userEmail;
 
- // ── FIX: Define Subject and Body ────────────────────────────────────────
-const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
+  const subjectB64 = Buffer.from(email.subject || '(no subject)', 'utf8').toString('base64');
+  const bodyType   = email.bodyType === 'html' ? 'html' : 'text';
+  const bodyContentType = bodyType === 'html' ? 'text/html' : 'text/plain';
+  let bodyContent  = String(email.body || '');
 
-const bodyType = email.bodyType === 'html' ? 'html' : 'text';
-const bodyContentType = bodyType === 'html' ? 'text/html' : 'text/plain';
-let bodyContent = String(email.body || '');
-
-// Force fallback if body is empty to solve "no content" issue
-// ✅ FIX: BLOCK EMPTY EMAILS
-if (!bodyContent || bodyContent.trim() === '') {
-    console.error('❌ ABORTING SEND: Email body is empty. Deleting this bad schedule.');
-    // Deactivate this specific email so it stops firing
+  if (!bodyContent || bodyContent.trim() === '') {
     deactivateEmail(email, 'empty_body_detected');
-    // Throw error to stop the process
     throw new Error('Email body is empty. Please delete this schedule and create a new one.');
-}
+  }
 
-const bodyB64 = chunkBase64Lines(Buffer.from(bodyContent, 'utf8').toString('base64'));
-
-const attachments = Array.isArray(email.attachments)
-  ? email.attachments.filter(a => a && (a.dataBase64 || a.data))
-  : [];
+  const bodyB64   = chunkBase64Lines(Buffer.from(bodyContent, 'utf8').toString('base64'));
+  const attachments = Array.isArray(email.attachments) ? email.attachments.filter(a => a && (a.dataBase64 || a.data)) : [];
 
   let mime;
 
   if (attachments.length === 0) {
     mime = [
-      `From: ${fromHeader}`,
-      `To: ${toHeader}`,
+      `From: ${fromHeader}`, `To: ${toHeader}`,
       ccHeader  ? `Cc: ${ccHeader}`   : null,
       bccHeader ? `Bcc: ${bccHeader}` : null,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
       `Content-Type: ${bodyContentType}; charset=UTF-8`,
-      'Content-Transfer-Encoding: base64',
-      '',
-      bodyB64,
+      'Content-Transfer-Encoding: base64', '', bodyB64,
     ].filter(v => v !== null && v !== undefined).join('\r\n');
   } else {
-    const parts = [
-      `--${boundary}`,
-      `Content-Type: ${bodyContentType}; charset=UTF-8`,
-      'Content-Transfer-Encoding: base64',
-      '',
-      bodyB64,
-      '',
-    ];
+    const parts = [`--${boundary}`, `Content-Type: ${bodyContentType}; charset=UTF-8`, 'Content-Transfer-Encoding: base64', '', bodyB64, ''];
 
     for (const att of attachments) {
       const attName = (att.name || 'attachment').replace(/[\r\n"]/g, '');
@@ -921,38 +879,23 @@ const attachments = Array.isArray(email.attachments)
       let b64 = (att.dataBase64 || att.data || '').replace(/\r?\n/g, '');
       if (b64.includes('base64,')) b64 = b64.split('base64,').pop() || '';
       if (!b64) continue;
-
-      parts.push('');
-      parts.push(`--${boundary}`);
-      parts.push(`Content-Type: ${attType}; name="${attName}"`);
-      parts.push(`Content-Disposition: attachment; filename="${attName}"`);
-      parts.push('Content-Transfer-Encoding: base64');
-      parts.push('');
-      parts.push(chunkBase64Lines(b64));
-      parts.push('');
+      parts.push('', `--${boundary}`, `Content-Type: ${attType}; name="${attName}"`, `Content-Disposition: attachment; filename="${attName}"`, 'Content-Transfer-Encoding: base64', '', chunkBase64Lines(b64), '');
     }
     parts.push(`--${boundary}--`);
 
     mime = [
-      `From: ${fromHeader}`,
-      `To: ${toHeader}`,
+      `From: ${fromHeader}`, `To: ${toHeader}`,
       ccHeader  ? `Cc: ${ccHeader}`   : null,
       bccHeader ? `Bcc: ${bccHeader}` : null,
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
-      `Content-Type: multipart/mixed; boundary="${boundary}"`,
-      '',
-      '',
+      `Content-Type: multipart/mixed; boundary="${boundary}"`, '', '',
       ...parts,
     ].filter(v => v !== null && v !== undefined).join('\r\n');
   }
 
-  const raw = Buffer.from(mime, 'utf8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+  const raw = Buffer.from(mime, 'utf8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
   try {
     const delays = [2000, 4000, 8000];
@@ -963,57 +906,32 @@ const attachments = Array.isArray(email.attachments)
       } catch (err) {
         const { status, apiMsg } = extractGoogleApiError(err);
         const retryable = Number.isFinite(status) && status >= 500 && status < 600;
-        if (retryable && attempt < delays.length) {
-          const waitMs = delays[attempt];
-          console.warn(`Gmail 5xx (${status}). Retry ${attempt + 1}/${delays.length} in ${waitMs}ms: ${apiMsg}`);
-          await sleep(waitMs);
-          continue;
-        }
+        if (retryable && attempt < delays.length) { await sleep(delays[attempt]); continue; }
         throw err;
       }
     }
   } catch (err) {
     const { status, apiMsg, reason, data } = extractGoogleApiError(err);
     let extra = '';
-
     const diagnostics = {
-      userEmail,
+      userEmail, instanceId,
       google: { status: status || null, reason: reason || null },
-      token: {
-        hasAccessToken: !!tokens.access_token,
-        hasRefreshToken: !!tokens.refresh_token,
-        expiry_date: tokens.expiry_date || null,
-        isExpired: isAccessTokenExpired(tokens),
-      },
+      token:  { hasAccessToken: !!tokens.access_token, hasRefreshToken: !!tokens.refresh_token, expiry_date: tokens.expiry_date || null, isExpired: isAccessTokenExpired(tokens) },
     };
-
-    const isFailedPrecondition =
-      status === 400 && (String(apiMsg).toLowerCase().includes('precondition') || reason === 'failedPrecondition');
-
+    const isFailedPrecondition = status === 400 && (String(apiMsg).toLowerCase().includes('precondition') || reason === 'failedPrecondition');
     if (isFailedPrecondition) {
       try {
         if (tokens.access_token) {
           const info = await oauth2.getTokenInfo(tokens.access_token);
-          diagnostics.tokenInfo = {
-            expires_in: info?.expires_in ?? null,
-            scope: info?.scope ?? null,
-          };
+          diagnostics.tokenInfo = { expires_in: info?.expires_in ?? null, scope: info?.scope ?? null };
           diagnostics.hasGmailSendScope = String(info?.scope || '').includes('gmail.send');
         }
-      } catch (e) {
-        diagnostics.tokenInfoError = String(e?.message || e);
-      }
-
+      } catch (e) { diagnostics.tokenInfoError = String(e?.message || e); }
       try {
         const prof = await gmail.users.getProfile({ userId: 'me' });
         diagnostics.profileEmail = prof?.data?.emailAddress || null;
-        if (diagnostics.profileEmail && diagnostics.profileEmail.toLowerCase() !== String(userEmail).toLowerCase()) {
-          diagnostics.profileMismatch = true;
-        }
-      } catch (e) {
-        diagnostics.profileError = String(e?.message || e);
-      }
-
+        if (diagnostics.profileEmail && diagnostics.profileEmail.toLowerCase() !== String(userEmail).toLowerCase()) diagnostics.profileMismatch = true;
+      } catch (e) { diagnostics.profileError = String(e?.message || e); }
       console.error('❌ Gmail failedPrecondition (400). Diagnostics:', diagnostics);
     } else {
       console.error('❌ Gmail send failed:', { status, reason, apiMsg });
@@ -1023,93 +941,145 @@ const attachments = Array.isArray(email.attachments)
     }
     throw new GmailSendError(`Gmail send failed${status ? ` (${status})` : ''}: ${apiMsg}${extra}`, {
       httpStatus: Number.isFinite(status) ? status : 500,
-      googleStatus: status || null,
-      googleReason: reason || null,
+      googleStatus: status || null, googleReason: reason || null,
       diagnostics: { ...diagnostics, rawGoogleError: data?.error || data || null },
     });
   }
   console.log(`✅ Sent: "${email.subject}" → ${toHeader} | attachments: ${attachments.length}`);
 }
 
-// ── Main scheduler — runs every minute ───────────────────────────────────────
+// ── Shared scheduler logic (used by both cron and /cron-tick) ─────────────────
 
-cron.schedule('* * * * *', async () => {
-  try {
-    const now    = new Date();
-    const emails = await Email.find({ active: true });
+async function runSchedulerTick() {
+  const now    = new Date();
+  const emails = await Email.find({ active: true });
 
-    for (const email of emails) {
-      if (isEmailDone(email)) continue;
-      if (!email.nextSendTime)  continue;
+  for (const email of emails) {
+    if (email.inFlightUntil && new Date(email.inFlightUntil) > new Date()) {
+      console.log(`⛔ Skipping (locked): ${email.subject}`);
+      continue;
+    }
+    if (isEmailDone(email))  continue;
+    if (!email.nextSendTime) continue;
 
-      const sendAt = new Date(email.nextSendTime);
-      if (sendAt > now) continue;
+    const sendAt = new Date(email.nextSendTime);
+    if (sendAt > now) continue;
 
-      if (email.lastSent) {
-        const diffMinutes = (now - new Date(email.lastSent)) / 1000 / 60;
-        if (diffMinutes < 5) {
-          console.log(`⏭️  Skipping "${email.subject}" — sent ${diffMinutes.toFixed(1)} min ago by Chrome`);
-          const isOnce = email.recurrence?.once === true || email.type === 'once';
-          if (!isOnce) {
-            await Email.findOneAndUpdate(
-              { id: email.id },
-              { nextSendTime: computeNextSendTime(email) }
-            );
+    if (email.lastSent) {
+      const diffMs = now.getTime() - new Date(email.lastSent).getTime();
+      if (diffMs < 2 * 60 * 1000) {
+        console.log(`🚫 Duplicate prevented (sent ${Math.round(diffMs/1000)}s ago): ${email.subject}`);
+        continue;
+      }
+    }
+
+    console.log(`⏰ Firing: "${email.subject}" (scheduled ${sendAt.toISOString()})`);
+
+    const locked = await tryAcquireSendLock(email.id);
+    if (!locked) continue;
+
+    const freshEmail = await Email.findOne({ id: email.id });
+
+    if (freshEmail && freshEmail.lastSent) {
+      const diffMs = Date.now() - new Date(freshEmail.lastSent).getTime();
+      if (diffMs < 2 * 60 * 1000) {
+        console.log(`🛑 Aborting ${email.subject}: Already sent ${Math.round(diffMs/1000)}s ago (detected via fresh read)`);
+        await releaseSendLock(email.id);
+        continue;
+      }
+    }
+
+    if (freshEmail && !freshEmail.active) {
+      await releaseSendLock(email.id);
+      continue;
+    }
+
+    const emailToSend = (freshEmail && freshEmail.toObject) ? freshEmail.toObject() : (locked.toObject ? locked.toObject() : locked);
+
+    try {
+      // ── FIX: forceReload tokens inside cron tick ───────────────────────────
+      // On Vercel each cron-tick is a fresh HTTP request with an empty cache.
+      // Without forceReload the allTokens object is {} and the send fails.
+      const allTokens  = await loadTokens({ forceReload: true });
+      const emailOwner = emailToSend.userEmail ? emailToSend.userEmail.toLowerCase() : null;
+      let   cronInstanceId = null;
+
+      if (emailOwner) {
+        for (const [key, val] of Object.entries(allTokens)) {
+          if (val && typeof val === 'object' && val.userEmail && val.tokens) {
+            if (val.userEmail.toLowerCase() === emailOwner) {
+              cronInstanceId = key;
+              break;
+            }
           }
-          continue;
         }
       }
 
-      console.log(`⏰ Firing: "${email.subject}" (scheduled ${sendAt.toISOString()})`);
+      await sendEmailViaGmail(emailToSend, cronInstanceId);
 
-      try {
-        const locked = await tryAcquireSendLock(email.id);
-        if (!locked) continue; // another sender (Chrome or cron) is handling it
-        await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked);
+      const newSentCount = (emailToSend.sentCount || 0) + 1;
+      const isOnce       = emailToSend.recurrence?.once === true || emailToSend.type === 'once';
+      const reachedMax   = emailToSend.maxTimes !== 'indefinitely' && newSentCount >= parseInt(emailToSend.maxTimes);
+      const isDone       = isOnce || reachedMax;
+      const nextSendTime = isDone ? null : computeNextSendTime(emailToSend);
 
-        const newSentCount = (email.sentCount || 0) + 1;
-        const isOnce       = email.recurrence?.once === true || email.type === 'once';
-        const reachedMax   = email.maxTimes !== 'indefinitely' &&
-                             newSentCount >= parseInt(email.maxTimes);
-        const isDone       = isOnce || reachedMax;
-
-              await Email.findOneAndUpdate(
-        { id: email.id },
+      await Email.findOneAndUpdate(
+        { id: emailToSend.id },
         {
-          sentCount:    newSentCount,
-          lastSent:     now.toISOString(),
-          active:       isDone ? false : email.active,
-          nextSendTime: isDone ? null  : computeNextSendTime(email),
+          sentCount: newSentCount,
+          lastSent:  now.toISOString(),
+          active:    isDone ? false : emailToSend.active,
+          nextSendTime,
           inFlightUntil: null,
         },
         { returnDocument: 'after' }
       );
 
-      } catch (err) {
-        console.error(`❌ Failed to send "${email.subject}":`, err.message);
-
-        // ✅ FIX: Only permanently deactivate on auth errors.
-        // For network/temporary errors, retry in 5 minutes instead of killing the schedule.
-        const msg = String(err?.message || '');
-        const isAuthError = msg.includes('401') ||
-                            msg.includes('No tokens') ||
-                            msg.includes('No refresh') ||
-                            msg.includes('refresh_token') ||
-                            msg.includes('Token expired') ||
-                            msg.includes('No authenticated');
-
-        if (isAuthError) {
-          console.log(`🔒 Auth error — deactivating "${email.subject}"`);
-          await Email.findOneAndUpdate({ id: email.id }, { active: false, inFlightUntil: null });
-        } else {
-          const retryAt = new Date(Date.now() + 5 * 60_000).toISOString();
-          console.log(`🔁 Temporary error — will retry "${email.subject}" at ${retryAt}`);
-          await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: retryAt, inFlightUntil: null });
-        }
-      } finally {
-        try { await releaseSendLock(email.id); } catch (_) {}
-      }
+    } catch (err) {
+      console.error(`❌ Failed to send "${email.subject}":`, err.message);
+    } finally {
+      try { await releaseSendLock(email.id); } catch (_) {}
     }
+  }
+}
+
+// ── /cron-tick endpoint — called by Vercel Cron every minute ─────────────────
+// WHY THIS EXISTS: Vercel is a serverless platform. The node-cron job below
+// only runs while a request is being handled — the process dies after each
+// response. So cron.schedule() never fires on its own between requests.
+//
+// FIX: Add a plain HTTP endpoint that Vercel Cron calls on a schedule.
+// This makes the scheduler work reliably on Vercel without any extra services.
+// Just add vercel.json (included alongside this file) and deploy — done.
+//
+// If you ever migrate to Railway/Render/a VPS (persistent process), the
+// cron.schedule below will handle it and you can ignore this endpoint.
+app.post('/cron-tick', async (req, res) => {
+  // Simple shared secret so random internet traffic can't spam this endpoint.
+  // Set CRON_SECRET=any-random-string in your Vercel environment variables.
+  const secret = process.env.CRON_SECRET || '';
+  if (secret) {
+    const authHeader = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+    if (authHeader !== secret) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
+  try {
+    await runSchedulerTick();
+    res.json({ ok: true, time: new Date().toISOString() });
+  } catch (err) {
+    console.error('cron-tick error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Main scheduler — runs every second (works on Railway/Render/VPS) ─────────
+// On Vercel this never fires between requests, so /cron-tick + vercel.json
+// handles scheduling instead. Both can coexist safely.
+cron.schedule('* * * * * *', async () => {
+  try {
+    await runSchedulerTick();
   } catch (err) {
     console.error('Cron error:', err.message);
   }
@@ -1123,7 +1093,7 @@ app.listen(PORT, () => {
   if (!process.env.MONGO_URI)        console.warn('⚠️  MONGO_URI not set!');
 });
 
-// Chrome heartbeat (prevents server from sending duplicates while Chrome is open)
+// Chrome heartbeat
 app.post('/heartbeat', (req, res) => {
   const userEmail = (req.body?.userEmail || '').toString().trim();
   if (userEmail) chromeHeartbeat.set(userEmail, Date.now());

@@ -9,4 +9,3 @@ const authStateSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model('AuthState', authStateSchema);
-
