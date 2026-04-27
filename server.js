@@ -520,13 +520,15 @@ app.post('/schedule', async (req, res) => {
 });
 
 app.post('/send-now', async (req, res) => {
+  // CHANGED: Only release the MongoDB send lock if THIS request acquired it.
+  // Otherwise a 409 response would clear another instance's lock and allow duplicate sends.
   let emailIdForUnlock = null;
   try {
     const incoming   = req.body?.email || req.body;
     const instanceId = getInstanceId(req);
 
     if (!incoming || !incoming.id) return res.status(400).json({ ok: false, error: 'Invalid email data' });
-    emailIdForUnlock = incoming.id;
+    // NOTE: Do not set emailIdForUnlock yet — we have not acquired the send lock.
 
     if (!incoming.userEmail) {
       const resolvedEmail = await getUserEmailForInstance(instanceId);
@@ -565,6 +567,9 @@ app.post('/send-now', async (req, res) => {
         error: 'Email is already sending. Please try again in a moment.',
       });
     }
+    // CHANGED: Mark that this request owns the lock (so finally can safely release)
+    emailIdForUnlock = merged.id;
+    // END CHANGED
 
     // CHANGED: Decrypt only at send-time (in memory)
     const lockedPlain = decryptEmailDoc(locked.toObject ? locked.toObject() : locked);
@@ -1004,8 +1009,10 @@ async function sendEmailViaGmail(email, instanceId = null) {
   if (attachments.length === 0) {
     mime = [
       `From: ${fromHeader}`, `To: ${toHeader}`,
-      ccHeader  ? `Cc: ${ccHeader}`   : null,
-      bccHeader ? `Bcc: ${bccHeader}` : null,
+      // CHANGED: Only include Cc/Bcc when genuinely non-empty after sanitization
+      (ccHeader && ccHeader.trim())  ? `Cc: ${ccHeader}`   : null,
+      (bccHeader && bccHeader.trim()) ? `Bcc: ${bccHeader}` : null,
+      // END CHANGED
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
@@ -1027,8 +1034,10 @@ async function sendEmailViaGmail(email, instanceId = null) {
 
     mime = [
       `From: ${fromHeader}`, `To: ${toHeader}`,
-      ccHeader  ? `Cc: ${ccHeader}`   : null,
-      bccHeader ? `Bcc: ${bccHeader}` : null,
+      // CHANGED: Only include Cc/Bcc when genuinely non-empty after sanitization
+      (ccHeader && ccHeader.trim())  ? `Cc: ${ccHeader}`   : null,
+      (bccHeader && bccHeader.trim()) ? `Bcc: ${bccHeader}` : null,
+      // END CHANGED
       `Subject: =?UTF-8?B?${subjectB64}?=`,
       `Date: ${new Date().toUTCString()}`,
       'MIME-Version: 1.0',
@@ -1245,7 +1254,7 @@ app.post('/cron-tick', async (req, res) => {
 // ── Main scheduler — runs every second (works on Railway/Render/VPS) ─────────
 // On Vercel this never fires between requests, so /cron-tick + vercel.json
 // handles scheduling instead. Both can coexist safely.
-cron.schedule('* * * * * *', async () => {
+cron.schedule('* * * * *', async () => {
   try {
     await runSchedulerTick();
   } catch (err) {
