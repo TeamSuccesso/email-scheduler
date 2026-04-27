@@ -14,7 +14,7 @@ const emailSchema = new mongoose.Schema({
   body:     { type: String, default: '' },
   bodyType: { type: String, default: 'text' },
 
-  attachments:   { type: Array,  default: [] },
+  attachments:   { type: mongoose.Schema.Types.Mixed, default: '' },
   attachmentIds: { type: Array,  default: [] },
 
   recurrence: { type: Object, default: {} },

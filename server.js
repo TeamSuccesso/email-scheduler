@@ -9,6 +9,14 @@ const { google } = require('googleapis');
 const mongoose   = require('mongoose');
 const Email      = require('./models/Email');
 const AuthState  = require('./models/AuthState');
+// CHANGED: AES-256-GCM encryption at rest (MongoDB)
+const {
+  getEncryptionKey,
+  encrypt, decrypt,
+  encryptObject, decryptObject,
+  FIELDS_TO_ENCRYPT, AUTH_FIELDS_TO_ENCRYPT,
+} = require('./utils/crypto');
+// END CHANGED
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +25,11 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 const chromeHeartbeat = new Map();
+
+// CHANGED: Validate ENCRYPTION_KEY on startup.
+// WARNING: If this key is lost, all encrypted data in MongoDB is unrecoverable.
+getEncryptionKey();
+// END CHANGED
 
 // ── Connect MongoDB ───────────────────────────────────────────────────────────
 
@@ -53,9 +66,26 @@ async function loadTokens(opts = {}) {
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'tokens' }).lean();
-      if (doc?.value && typeof doc.value === 'object') return setTokensCache(doc.value);
+      // CHANGED: Decrypt AuthState.value (tokens) when stored as AES-256-GCM string
+      if (doc?.value) {
+        if (typeof doc.value === 'string') {
+          const decrypted = decrypt(doc.value);
+          const parsed = decrypted ? JSON.parse(decrypted) : {};
+          if (parsed && typeof parsed === 'object') return setTokensCache(parsed);
+        } else if (typeof doc.value === 'object') {
+          return setTokensCache(doc.value); // backward compatibility (legacy plaintext object)
+        }
+      }
+      // END CHANGED
     }
-  } catch (_) {}
+  } catch (err) {
+    // CHANGED: Surface crypto errors (e.g., wrong ENCRYPTION_KEY) instead of silently falling back.
+    const msg = String(err?.message || err || '');
+    if (msg.includes('ENCRYPTION_KEY') || msg.startsWith('Decryption failed') || msg.includes('Encrypted value')) {
+      throw err;
+    }
+    // END CHANGED
+  }
   if (!fs.existsSync(TOKENS_FILE)) return setTokensCache({});
   try { return setTokensCache(JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'))); }
   catch (_) { return setTokensCache({}); }
@@ -65,7 +95,10 @@ async function saveTokens(tokens) {
   setTokensCache(tokens);
   try {
     if (mongoose.connection.readyState === 1) {
-      await AuthState.findOneAndUpdate({ key: 'tokens' }, { value: _tokensCache }, { upsert: true });
+      // CHANGED: Encrypt AuthState.value (tokens) before saving to MongoDB
+      const encryptedValue = encrypt(JSON.stringify(_tokensCache || {}));
+      await AuthState.findOneAndUpdate({ key: 'tokens' }, { value: encryptedValue }, { upsert: true });
+      // END CHANGED
     }
   } catch (_) {}
   try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(_tokensCache, null, 2)); } catch (_) {}
@@ -86,9 +119,26 @@ async function loadAuthMeta(opts = {}) {
   try {
     if (mongoose.connection.readyState === 1) {
       const doc = await AuthState.findOne({ key: 'meta' }).lean();
-      if (doc?.value && typeof doc.value === 'object') return setAuthMetaCache(doc.value);
+      // CHANGED: Decrypt AuthState.value (meta) when stored as AES-256-GCM string
+      if (doc?.value) {
+        if (typeof doc.value === 'string') {
+          const decrypted = decrypt(doc.value);
+          const parsed = decrypted ? JSON.parse(decrypted) : {};
+          if (parsed && typeof parsed === 'object') return setAuthMetaCache(parsed);
+        } else if (typeof doc.value === 'object') {
+          return setAuthMetaCache(doc.value); // backward compatibility (legacy plaintext object)
+        }
+      }
+      // END CHANGED
     }
-  } catch (_) {}
+  } catch (err) {
+    // CHANGED: Surface crypto errors (e.g., wrong ENCRYPTION_KEY) instead of silently falling back.
+    const msg = String(err?.message || err || '');
+    if (msg.includes('ENCRYPTION_KEY') || msg.startsWith('Decryption failed') || msg.includes('Encrypted value')) {
+      throw err;
+    }
+    // END CHANGED
+  }
   if (!fs.existsSync(AUTH_META_FILE)) return setAuthMetaCache({});
   try { return setAuthMetaCache(JSON.parse(fs.readFileSync(AUTH_META_FILE, 'utf8'))); }
   catch (_) { return setAuthMetaCache({}); }
@@ -98,7 +148,10 @@ async function saveAuthMeta(meta) {
   setAuthMetaCache(meta);
   try {
     if (mongoose.connection.readyState === 1) {
-      await AuthState.findOneAndUpdate({ key: 'meta' }, { value: _authMetaCache }, { upsert: true });
+      // CHANGED: Encrypt AuthState.value (meta) before saving to MongoDB
+      const encryptedValue = encrypt(JSON.stringify(_authMetaCache || {}));
+      await AuthState.findOneAndUpdate({ key: 'meta' }, { value: encryptedValue }, { upsert: true });
+      // END CHANGED
     }
   } catch (_) {}
   try { fs.writeFileSync(AUTH_META_FILE, JSON.stringify(_authMetaCache, null, 2)); } catch (_) {}
@@ -446,10 +499,16 @@ app.post('/schedule', async (req, res) => {
 
       delete updateDoc._id;
 
-      await Email.findOneAndUpdate({ id: incoming.id }, updateDoc, { returnDocument: 'after' });
+      // CHANGED: Encrypt sensitive fields before saving to MongoDB
+      const encryptedUpdateDoc = encryptEmailDoc(updateDoc);
+      await Email.findOneAndUpdate({ id: incoming.id }, encryptedUpdateDoc, { returnDocument: 'after' });
+      // END CHANGED
       console.log(`📝 Updated: "${incoming.subject}" | attachments: ${(updateDoc.attachments || existing.attachments || []).length}`);
     } else {
-      await Email.create(incoming);
+      // CHANGED: Encrypt sensitive fields before saving to MongoDB
+      // NOTE: Use findOneAndUpdate+upsert to avoid the Email pre('save') hook overwriting userEmailLower.
+      await Email.findOneAndUpdate({ id: incoming.id }, encryptEmailDoc(incoming), { upsert: true });
+      // END CHANGED
       console.log(`📅 New: "${incoming.subject}" → ${incoming.nextSendTime} | attachments: ${(incoming.attachments || []).length}`);
     }
 
@@ -479,28 +538,38 @@ app.post('/send-now', async (req, res) => {
     incoming.cc  = sanitizeRecipient(incoming.cc);
     incoming.bcc = sanitizeRecipient(incoming.bcc);
 
+    // CHANGED: Decrypt DB record (if any) before merge, and encrypt before saving back to MongoDB
     const existing = await Email.findOne({ id: incoming.id });
-    const merged   = existing ? { ...existing.toObject(), ...incoming } : incoming;
+    const existingPlain = existing ? decryptEmailDoc(existing.toObject()) : null;
+    const merged   = existingPlain ? { ...existingPlain, ...incoming } : incoming;
 
-    if ((!Array.isArray(merged.attachments) || merged.attachments.length === 0) && existing?.attachments?.length) {
-      merged.attachments = existing.attachments;
+    if ((!Array.isArray(merged.attachments) || merged.attachments.length === 0) && Array.isArray(existingPlain?.attachments) && existingPlain.attachments.length) {
+      merged.attachments = existingPlain.attachments;
     }
 
     const mergedToStore = { ...merged };
     delete mergedToStore.inFlightUntil;
-    await Email.findOneAndUpdate({ id: merged.id }, mergedToStore, { upsert: true });
+    await Email.findOneAndUpdate({ id: merged.id }, encryptEmailDoc(mergedToStore), { upsert: true });
+    // END CHANGED
 
     const locked = await tryAcquireSendLock(merged.id);
     if (!locked) {
       const current = await Email.findOne({ id: merged.id });
+      // CHANGED: Return plaintext email payload even when send lock is held
+      const currentPlain = decryptEmailDoc(current?.toObject ? current.toObject() : current);
+      const currentPayload = stripEmailPayload(currentPlain);
+      // END CHANGED
       return res.status(409).json({
         ok: false, inProgress: true, retryAfterMs: 30_000,
-        email: stripEmailPayload(current),
+        email: currentPayload,
         error: 'Email is already sending. Please try again in a moment.',
       });
     }
 
-    await sendEmailViaGmail(locked.toObject ? locked.toObject() : locked, instanceId);
+    // CHANGED: Decrypt only at send-time (in memory)
+    const lockedPlain = decryptEmailDoc(locked.toObject ? locked.toObject() : locked);
+    await sendEmailViaGmail(lockedPlain, instanceId);
+    // END CHANGED
 
     const now          = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
@@ -515,7 +584,10 @@ app.post('/send-now', async (req, res) => {
       { returnDocument: 'after' }
     );
 
-    res.json({ ok: true, email: stripEmailPayload(updated) });
+    // CHANGED: Always return plaintext to the extension (decrypt response)
+    const updatedPlain = decryptEmailDoc(updated?.toObject ? updated.toObject() : updated);
+    res.json({ ok: true, email: stripEmailPayload(updatedPlain) });
+    // END CHANGED
   } catch (err) {
     const status = (err && typeof err === 'object' && Number.isFinite(err.httpStatus)) ? err.httpStatus : 500;
     res.status(status).json({ ok: false, error: err?.message || String(err || 'Unknown error') });
@@ -658,13 +730,18 @@ app.get('/emails', async (req, res) => {
         };
         const unassignedCount = await Email.countDocuments(unassignedFilter);
         if (unassignedCount > 0) {
-          await Email.updateMany(unassignedFilter, { userEmail: primary, userEmailLower });
+          // CHANGED: Store encrypted userEmail while keeping userEmailLower plaintext for queries
+          await Email.updateMany(unassignedFilter, { userEmail: encrypt(primary), userEmailLower });
+          // END CHANGED
           emails = await Email.find({ $or: [{ userEmailLower }, { userEmail: primary }] }).select('-attachments');
         }
       }
     }
 
-    res.json(emails);
+    // CHANGED: Decrypt sensitive fields before returning to the extension (attachments already stripped by select)
+    const plainEmails = (emails || []).map(e => decryptEmailDoc(e?.toObject ? e.toObject() : e));
+    res.json(plainEmails);
+    // END CHANGED
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -686,14 +763,36 @@ app.delete('/schedule/:id', async (req, res) => {
 
 app.patch('/schedule/:id', async (req, res) => {
   try {
-    if (req.body && req.body.userEmail) {
-      const u = String(req.body.userEmail || '').trim();
-      req.body.userEmail      = u;
-      req.body.userEmailLower = u ? u.toLowerCase() : '';
+    // CHANGED: Encrypt any sensitive fields included in the PATCH update
+    const updateDoc = { ...(req.body || {}) };
+
+    if (updateDoc && updateDoc.userEmail) {
+      const u = String(updateDoc.userEmail || '').trim();
+      updateDoc.userEmail      = u;
+      updateDoc.userEmailLower = u ? u.toLowerCase() : '';
     }
-    const updated = await Email.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+
+    for (const field of FIELDS_TO_ENCRYPT) {
+      if (!(field in updateDoc)) continue;
+      const val = updateDoc[field];
+      if (val === null || val === undefined) continue;
+
+      if (field === 'attachments') {
+        if (val === '') updateDoc.attachments = '';
+        else if (typeof val === 'string') updateDoc.attachments = encrypt(val);
+        else updateDoc.attachments = encrypt(JSON.stringify(val));
+      } else {
+        updateDoc[field] = encrypt(String(val));
+      }
+    }
+
+    const updated = await Email.findOneAndUpdate({ id: req.params.id }, updateDoc, { new: true });
+    // END CHANGED
     if (!updated) return res.status(404).json({ error: 'Not found' });
-    res.json({ ok: true, email: stripEmailPayload(updated) });
+    // CHANGED: Return plaintext to extension
+    const updatedPlain = decryptEmailDoc(updated?.toObject ? updated.toObject() : updated);
+    res.json({ ok: true, email: stripEmailPayload(updatedPlain) });
+    // END CHANGED
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -714,6 +813,49 @@ function stripEmailPayload(emailDoc) {
   delete obj.attachments;
   return obj;
 }
+
+// CHANGED: Encrypt/decrypt Email docs for MongoDB at-rest protection (AES-256-GCM)
+function encryptEmailDoc(doc) {
+  const base = (doc && typeof doc === 'object') ? { ...doc } : {};
+  const withoutAttachments = FIELDS_TO_ENCRYPT.filter(f => f !== 'attachments');
+  const out = encryptObject(base, withoutAttachments);
+
+  if ('attachments' in base) {
+    const at = base.attachments;
+    if (at === null || at === undefined || at === '') out.attachments = '';
+    else if (typeof at === 'string') out.attachments = encrypt(at);
+    else out.attachments = encrypt(JSON.stringify(at));
+  }
+
+  return out;
+}
+
+function decryptEmailDoc(doc) {
+  const base = (doc && typeof doc === 'object') ? { ...doc } : {};
+  const withoutAttachments = FIELDS_TO_ENCRYPT.filter(f => f !== 'attachments');
+  const out = decryptObject(base, withoutAttachments);
+
+  if ('attachments' in base) {
+    const at = base.attachments;
+    if (at === null || at === undefined || at === '') {
+      out.attachments = [];
+    } else if (Array.isArray(at)) {
+      out.attachments = at;
+    } else if (typeof at === 'string') {
+      const decrypted = decrypt(at);
+      if (!decrypted) out.attachments = [];
+      else {
+        try { out.attachments = JSON.parse(decrypted); }
+        catch (_) { throw new Error(`Failed to parse decrypted attachments JSON for email id=${String(base.id || '')}`); }
+      }
+    } else {
+      out.attachments = at;
+    }
+  }
+
+  return out;
+}
+// END CHANGED
 
 async function tryAcquireSendLock(emailId, lockMs = 2 * 60_000) {
   const nowIso   = new Date().toISOString();
@@ -951,6 +1093,7 @@ async function sendEmailViaGmail(email, instanceId = null) {
 // ── Shared scheduler logic (used by both cron and /cron-tick) ─────────────────
 
 async function runSchedulerTick() {
+  // CHANGED: Client-first, Server-fallback — server must skip sends when Chrome heartbeat is fresh
   const now    = new Date();
   const emails = await Email.find({ active: true });
 
@@ -974,6 +1117,23 @@ async function runSchedulerTick() {
     }
 
     console.log(`⏰ Firing: "${email.subject}" (scheduled ${sendAt.toISOString()})`);
+
+    // CHANGED: If Chrome is alive for this user (heartbeat within last 5 minutes), never send from server.
+    const lastHeartbeat = chromeHeartbeat.get(
+      (email.userEmail || '').toLowerCase()
+    );
+    const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+    const chromeIsAlive = lastHeartbeat &&
+                          lastHeartbeat > fiveMinutesAgo;
+
+    if (chromeIsAlive) {
+      console.log(
+        `⏭️  Chrome active for ${email.userEmail} — ` +
+        `skipping server send: "${email.subject}"`
+      );
+      continue;
+    }
+    // END CHANGED
 
     const locked = await tryAcquireSendLock(email.id);
     if (!locked) continue;
@@ -1001,7 +1161,12 @@ async function runSchedulerTick() {
       // On Vercel each cron-tick is a fresh HTTP request with an empty cache.
       // Without forceReload the allTokens object is {} and the send fails.
       const allTokens  = await loadTokens({ forceReload: true });
-      const emailOwner = emailToSend.userEmail ? emailToSend.userEmail.toLowerCase() : null;
+
+      // CHANGED: Decrypt only at send-time (in memory)
+      const decryptedEmailToSend = decryptEmailDoc(emailToSend);
+      // END CHANGED
+
+      const emailOwner = decryptedEmailToSend.userEmail ? decryptedEmailToSend.userEmail.toLowerCase() : null;
       let   cronInstanceId = null;
 
       if (emailOwner) {
@@ -1015,7 +1180,9 @@ async function runSchedulerTick() {
         }
       }
 
-      await sendEmailViaGmail(emailToSend, cronInstanceId);
+      // CHANGED: Decrypt only at send-time (in memory)
+      await sendEmailViaGmail(decryptedEmailToSend, cronInstanceId);
+      // END CHANGED
 
       const newSentCount = (emailToSend.sentCount || 0) + 1;
       const isOnce       = emailToSend.recurrence?.once === true || emailToSend.type === 'once';
@@ -1041,6 +1208,7 @@ async function runSchedulerTick() {
       try { await releaseSendLock(email.id); } catch (_) {}
     }
   }
+  // END CHANGED
 }
 
 // ── /cron-tick endpoint — called by Vercel Cron every minute ─────────────────
@@ -1095,7 +1263,10 @@ app.listen(PORT, () => {
 
 // Chrome heartbeat
 app.post('/heartbeat', (req, res) => {
-  const userEmail = (req.body?.userEmail || '').toString().trim();
+  // CHANGED: Always store heartbeat key in lowercase (matches runSchedulerTick lookup)
+  const userEmail = (req.body?.userEmail || '')
+    .toString().trim().toLowerCase();
   if (userEmail) chromeHeartbeat.set(userEmail, Date.now());
+  // END CHANGED
   res.json({ ok: true });
 });
