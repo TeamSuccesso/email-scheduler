@@ -296,6 +296,8 @@ app.get('/oauth/callback', async (req, res) => {
     }
 
     allTokens[instanceId] = { userEmail: email, tokens };
+    // BUG 4 FIX: Also store under email key so lookup by userEmail works during auth/status scans
+    allTokens[email]      = { userEmail: email, tokens };
 
     await saveTokens(allTokens);
 
@@ -362,7 +364,19 @@ app.post('/oauth/token', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ── FIX: /auth/status — always force-reload from MongoDB ─────────────────────
+// BUG 4 FIX: waitForDB — ensure MongoDB is ready before reading tokens on cold start
+async function waitForDB(ms = 3000) {
+  if (mongoose.connection.readyState === 1) return true;
+  return new Promise(resolve => {
+    const t = Date.now();
+    const i = setInterval(() => {
+      if (mongoose.connection.readyState === 1) { clearInterval(i); resolve(true); }
+      if (Date.now() - t > ms)                  { clearInterval(i); resolve(false); }
+    }, 200);
+  });
+}
+
+// FIX: Always read from MongoDB here so the real persisted auth is returned.
 // WHY: On Vercel (serverless), every request may start a fresh Node process.
 // _tokensCache is always null on cold start, so without forceReload the server
 // always returns { connected: false } — making the extension show "Not connected"
@@ -370,6 +384,9 @@ app.post('/oauth/token', async (req, res) => {
 // FIX: Always read from MongoDB here so the real persisted auth is returned.
 app.get('/auth/status', async (req, res) => {
   try {
+    // BUG 4 FIX: Wait for DB before reading — avoids cold-start false negatives
+    await waitForDB(3000);
+
     const instanceId = getInstanceId(req);
 
     if (instanceId) {
@@ -379,13 +396,27 @@ app.get('/auth/status', async (req, res) => {
       if (entry?.userEmail && entry?.tokens) {
         return res.json({ connected: true, email: entry.userEmail });
       }
+      // BUG 4 FIX: Scan all entries for matching userEmail (handles case where
+      // token was stored under email key only, not instanceId)
+      for (const val of Object.values(allTokens)) {
+        if (val && typeof val === 'object' && val.userEmail && val.tokens) {
+          // check if this entry could be ours via meta
+          const meta = await loadAuthMeta({ forceReload: true });
+          const instMeta = meta[instanceId];
+          if (instMeta?.lastConnectedEmail && instMeta.lastConnectedEmail === val.userEmail) {
+            return res.json({ connected: true, email: val.userEmail });
+          }
+        }
+      }
       return res.json({ connected: false, email: null });
     }
 
     const email = await getPrimaryUserEmail();
+    // BUG 4 FIX: Always return 200 (never 500)
     res.json({ connected: !!email, email: email || null });
   } catch (err) {
-    res.status(500).json({ connected: false, email: null, error: err.message });
+    // BUG 4 FIX: Always return 200 so popup doesn't flip to "unknown" on transient errors
+    res.status(200).json({ connected: false, email: null, error: err.message });
   }
 });
 
@@ -454,7 +485,8 @@ app.post('/schedule', async (req, res) => {
     incoming.userEmailLower = incoming.userEmail ? incoming.userEmail.toLowerCase() : '';
 
     if (incoming.fromChrome && incoming.userEmail) {
-      chromeHeartbeat.set(incoming.userEmail, Date.now());
+      // FIX: Always store heartbeat key in lowercase to match runSchedulerTick lookup
+      chromeHeartbeat.set(incoming.userEmail.toLowerCase(), Date.now());
     }
 
     incoming.to  = sanitizeRecipient(incoming.to);
@@ -540,7 +572,7 @@ app.post('/send-now', async (req, res) => {
     incoming.cc  = sanitizeRecipient(incoming.cc);
     incoming.bcc = sanitizeRecipient(incoming.bcc);
 
-    // CHANGED: Decrypt DB record (if any) before merge, and encrypt before saving back to MongoDB
+    // Read existing record from DB (needed to get attachments and current state)
     const existing = await Email.findOne({ id: incoming.id });
     const existingPlain = existing ? decryptEmailDoc(existing.toObject()) : null;
     const merged   = existingPlain ? { ...existingPlain, ...incoming } : incoming;
@@ -549,32 +581,31 @@ app.post('/send-now', async (req, res) => {
       merged.attachments = existingPlain.attachments;
     }
 
-    const mergedToStore = { ...merged };
-    delete mergedToStore.inFlightUntil;
-    await Email.findOneAndUpdate({ id: merged.id }, encryptEmailDoc(mergedToStore), { upsert: true });
-    // END CHANGED
-
+    // FIX: Acquire the send lock BEFORE writing updated data to DB.
+    // Previously the upsert happened before tryAcquireSendLock — meaning two
+    // simultaneous callers (Chrome alarm + server cron) could both write, then
+    // both race for the lock. Now we lock first, then write+send atomically.
     const locked = await tryAcquireSendLock(merged.id);
     if (!locked) {
       const current = await Email.findOne({ id: merged.id });
-      // CHANGED: Return plaintext email payload even when send lock is held
       const currentPlain = decryptEmailDoc(current?.toObject ? current.toObject() : current);
       const currentPayload = stripEmailPayload(currentPlain);
-      // END CHANGED
       return res.status(409).json({
         ok: false, inProgress: true, retryAfterMs: 30_000,
         email: currentPayload,
         error: 'Email is already sending. Please try again in a moment.',
       });
     }
-    // CHANGED: Mark that this request owns the lock (so finally can safely release)
     emailIdForUnlock = merged.id;
-    // END CHANGED
 
-    // CHANGED: Decrypt only at send-time (in memory)
-    const lockedPlain = decryptEmailDoc(locked.toObject ? locked.toObject() : locked);
+    // Write merged data to DB now that we hold the lock
+    const mergedToStore = { ...merged };
+    delete mergedToStore.inFlightUntil;
+    await Email.findOneAndUpdate({ id: merged.id }, encryptEmailDoc(mergedToStore), { upsert: true });
+
+    // Decrypt and send
+    const lockedPlain = decryptEmailDoc(merged);
     await sendEmailViaGmail(lockedPlain, instanceId);
-    // END CHANGED
 
     const now          = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
@@ -717,10 +748,12 @@ app.get('/emails', async (req, res) => {
     const userEmailLower = userEmail ? userEmail.toLowerCase() : '';
     const filter = userEmail ? { $or: [{ userEmailLower }, { userEmail }] } : {};
 
-    let emails = await Email.find(filter).select('-attachments');
+    // BUG 3 FIX: Return all emails (active AND inactive), limit 200, sorted newest-first.
+    // Previously missing .limit() and only returning active emails caused popup to show only 1-2.
+    let emails = await Email.find(filter).select('-attachments').sort({ createdAt: -1 }).limit(200);
 
     if (userEmail && !emails.length) {
-      emails = await Email.find({ userEmail }).collation({ locale: 'en', strength: 2 }).select('-attachments');
+      emails = await Email.find({ userEmail }).collation({ locale: 'en', strength: 2 }).select('-attachments').sort({ createdAt: -1 }).limit(200);
     }
 
     if (userEmail && !emails.length) {
@@ -865,9 +898,18 @@ function decryptEmailDoc(doc) {
 async function tryAcquireSendLock(emailId, lockMs = 2 * 60_000) {
   const nowIso   = new Date().toISOString();
   const untilIso = new Date(Date.now() + lockMs).toISOString();
+  // BUG 1C FIX: Must include $exists:false so newly-inserted docs (no inFlightUntil field) are also matchable.
+  // Without this, a doc created before the inFlightUntil field existed would never acquire the lock.
   return Email.findOneAndUpdate(
-    { id: emailId, $or: [{ inFlightUntil: null }, { inFlightUntil: { $lt: nowIso } }] },
-    { inFlightUntil: untilIso },
+    {
+      id: emailId,
+      $or: [
+        { inFlightUntil: null },
+        { inFlightUntil: { $exists: false } },
+        { inFlightUntil: { $lt: nowIso } },
+      ],
+    },
+    { $set: { inFlightUntil: untilIso } },
     { returnDocument: 'after' }
   );
 }
@@ -1048,6 +1090,21 @@ async function sendEmailViaGmail(email, instanceId = null) {
 
   const raw = Buffer.from(mime, 'utf8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
+  // LAST RESORT: Re-read DB immediately before calling Gmail API.
+  // If another process already sent this within the last 5 minutes, abort.
+  // This is the final safety net when all lock mechanisms have been bypassed.
+  if (email.id) {
+    const freshCheck = await Email.findOne({ id: email.id }).lean();
+    if (freshCheck?.lastSent) {
+      const msSince = Date.now() - new Date(freshCheck.lastSent).getTime();
+      if (msSince < 5 * 60 * 1000) {
+        throw new Error(
+          'DUPLICATE_PREVENTED: already sent ' + Math.round(msSince / 1000) + 's ago for id=' + String(email.id)
+        );
+      }
+    }
+  }
+
   try {
     const delays = [2000, 4000, 8000];
     for (let attempt = 0; attempt < (delays.length + 1); attempt++) {
@@ -1102,13 +1159,12 @@ async function sendEmailViaGmail(email, instanceId = null) {
 // ── Shared scheduler logic (used by both cron and /cron-tick) ─────────────────
 
 async function runSchedulerTick() {
-  // CHANGED: Client-first, Server-fallback — server must skip sends when Chrome heartbeat is fresh
   const now    = new Date();
   const emails = await Email.find({ active: true });
 
   for (const email of emails) {
     if (email.inFlightUntil && new Date(email.inFlightUntil) > new Date()) {
-      console.log(`⛔ Skipping (locked): ${email.subject}`);
+      console.log('[cron] Skipping locked:', email.id);
       continue;
     }
     if (isEmailDone(email))  continue;
@@ -1119,30 +1175,30 @@ async function runSchedulerTick() {
 
     if (email.lastSent) {
       const diffMs = now.getTime() - new Date(email.lastSent).getTime();
-      if (diffMs < 2 * 60 * 1000) {
-        console.log(`🚫 Duplicate prevented (sent ${Math.round(diffMs/1000)}s ago): ${email.subject}`);
+      if (diffMs < 5 * 60 * 1000) {
+        // 5-minute guard: prevents re-fire even if Chrome and cron both attempt
+        // to send within the same recurrence window
+        console.log(`[cron] Duplicate prevented (sent ${Math.round(diffMs/1000)}s ago):`, email.id);
         continue;
       }
     }
 
-    console.log(`⏰ Firing: "${email.subject}" (scheduled ${sendAt.toISOString()})`);
+    console.log('[cron] Firing email id=' + email.id + ' scheduled=' + sendAt.toISOString());
 
-    // CHANGED: If Chrome is alive for this user (heartbeat within last 5 minutes), never send from server.
-    const lastHeartbeat = chromeHeartbeat.get(
-      (email.userEmail || '').toLowerCase()
-    );
-    const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
-    const chromeIsAlive = lastHeartbeat &&
-                          lastHeartbeat > fiveMinutesAgo;
+    // ROOT CAUSE FIX: email.userEmail is AES-ENCRYPTED in MongoDB — using it for
+    // chromeHeartbeat.get() always returns undefined (encrypted blob never matches).
+    // userEmailLower is stored PLAINTEXT for query purposes — use it instead.
+    // Also fixed: /schedule was storing heartbeat with original-case email;
+    // now always lowercased before storing (see /schedule and /heartbeat handlers).
+    const ownerEmailLower = (email.userEmailLower || '').toLowerCase().trim();
+    const lastHeartbeat   = ownerEmailLower ? chromeHeartbeat.get(ownerEmailLower) : null;
+    const twoMinutesAgo   = Date.now() - (2 * 60 * 1000);
+    const chromeIsAlive   = !!(lastHeartbeat && lastHeartbeat > twoMinutesAgo);
 
     if (chromeIsAlive) {
-      console.log(
-        `⏭️  Chrome active for ${email.userEmail} — ` +
-        `skipping server send: "${email.subject}"`
-      );
+      console.log('[cron] Chrome active for ' + ownerEmailLower + ' — skipping server send:', email.id);
       continue;
     }
-    // END CHANGED
 
     const locked = await tryAcquireSendLock(email.id);
     if (!locked) continue;
@@ -1151,8 +1207,8 @@ async function runSchedulerTick() {
 
     if (freshEmail && freshEmail.lastSent) {
       const diffMs = Date.now() - new Date(freshEmail.lastSent).getTime();
-      if (diffMs < 2 * 60 * 1000) {
-        console.log(`🛑 Aborting ${email.subject}: Already sent ${Math.round(diffMs/1000)}s ago (detected via fresh read)`);
+      if (diffMs < 5 * 60 * 1000) {
+        console.log('[cron] Aborting: already sent ' + Math.round(diffMs/1000) + 's ago (fresh read):', email.id);
         await releaseSendLock(email.id);
         continue;
       }
@@ -1254,18 +1310,34 @@ app.post('/cron-tick', async (req, res) => {
 // ── Main scheduler — runs every second (works on Railway/Render/VPS) ─────────
 // On Vercel this never fires between requests, so /cron-tick + vercel.json
 // handles scheduling instead. Both can coexist safely.
-cron.schedule('* * * * *', async () => {
+async function runEmailCron() {
   try {
     await runSchedulerTick();
   } catch (err) {
     console.error('Cron error:', err.message);
   }
-});
+}
+
+cron.schedule('* * * * *', runEmailCron);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
+app.post('/run-cron', async (req, res) => {
+  const secret = (req.headers['x-cron-secret'] || '').toString().trim();
+  if (!secret || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    await runEmailCron();
+    res.json({ ok: true, time: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Recurring Emails server running on port ${PORT}`);
+  if (!process.env.CRON_SECRET) console.warn('⚠️  CRON_SECRET not set!');
   if (!process.env.GOOGLE_CLIENT_ID) console.warn('⚠️  GOOGLE_CLIENT_ID not set!');
   if (!process.env.MONGO_URI)        console.warn('⚠️  MONGO_URI not set!');
 });
