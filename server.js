@@ -21,7 +21,17 @@ const {
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow Chrome extensions, and no-origin requests (Render health checks, cron pings)
+    if (!origin || /^chrome-extension:\/\//.test(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS: origin not allowed'));
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'x-instance-id', 'authorization', 'x-cron-secret'],
+}));
 app.use(express.json({ limit: '50mb' }));
 
 const chromeHeartbeat = new Map();
