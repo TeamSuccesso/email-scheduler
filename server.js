@@ -943,40 +943,71 @@ function makeDateAt(year, month, day, h, m) {
 function computeNextSendTime(email) {
   const r = email.recurrence || {};
   const now = new Date();
-  const [h, m] = (email.time || '08:00').split(':').map(Number);
+
+  // Parse time safely — default to 08:00
+  const timeParts = (email.time || '08:00').split(':');
+  const h = parseInt(timeParts[0], 10) || 0;
+  const m = parseInt(timeParts[1], 10) || 0;
 
   if (r.once) return null;
 
+  // ── Hourly: exactly N hours from now ─────────────────────────────────────
   if (r.hours) {
     return new Date(now.getTime() + r.hours * 3_600_000).toISOString();
   }
 
+  // ── Daily: next occurrence of exact time ─────────────────────────────────
+  if (r.days) {
+    const candidate = new Date(
+      now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+    );
+    // If today's time has already passed, move to tomorrow
+    if (candidate.getTime() <= now.getTime()) {
+      candidate.setDate(candidate.getDate() + r.days);
+    }
+    return candidate.toISOString();
+  }
+
+  // ── Weekly: next occurrence of target weekday at exact time ──────────────
   if (r.weeks) {
     const targetDay = typeof r.dayOfWeek === 'number' ? r.dayOfWeek : 1;
-    const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+    const candidate = new Date(
+      now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+    );
     let daysUntil = (targetDay - now.getDay() + 7) % 7;
-    if (daysUntil === 0 && candidate <= now) daysUntil = 7;
+    // If today is the target day but time already passed (or just sent),
+    // schedule for NEXT week
+    if (daysUntil === 0) {
+      daysUntil = 7;
+    }
     candidate.setDate(candidate.getDate() + daysUntil);
     return candidate.toISOString();
   }
 
-  if (r.days) {
-    const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
-    if (candidate <= now) candidate.setDate(candidate.getDate() + r.days);
-    return candidate.toISOString();
-  }
-
+  // ── Monthly: same day-of-month next month at exact time ───────────────────
   if (r.months) {
     const targetDOM = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : now.getDate();
-    const nextMonth = new Date(now.getFullYear(), now.getMonth() + r.months, 1);
-    const daysInMonth = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
-    const clampedDay  = Math.min(Math.max(1, targetDOM), daysInMonth);
-    const candidate   = makeDateAt(nextMonth.getFullYear(), nextMonth.getMonth(), clampedDay, h, m);
+    // Always go to next month
+    const nextMonthDate = new Date(
+      now.getFullYear(), now.getMonth() + r.months, 1
+    );
+    const daysInNextMonth = new Date(
+      nextMonthDate.getFullYear(), nextMonthDate.getMonth() + 1, 0
+    ).getDate();
+    const clampedDay = Math.min(Math.max(1, targetDOM), daysInNextMonth);
+    const candidate = new Date(
+      nextMonthDate.getFullYear(), nextMonthDate.getMonth(), clampedDay, h, m, 0, 0
+    );
     return candidate.toISOString();
   }
 
-  const candidate = makeDateAt(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
-  if (candidate <= now) candidate.setDate(candidate.getDate() + 1);
+  // ── Fallback: daily ───────────────────────────────────────────────────────
+  const candidate = new Date(
+    now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+  );
+  if (candidate.getTime() <= now.getTime()) {
+    candidate.setDate(candidate.getDate() + 1);
+  }
   return candidate.toISOString();
 }
 
