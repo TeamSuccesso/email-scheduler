@@ -935,14 +935,29 @@ function isEmailDone(email) {
   return !email.active || (isOnce && (email.sentCount || 0) >= 1) || reachedMax;
 }
 
-function makeDateAt(year, month, day, h, m) {
-  const d = new Date(year, month, day, h, m, 0, 0);
-  return d;
+// ── Timezone offset for IST (UTC+5:30) ────────────────────────────────────────
+// Server runs on Render in UTC. All user-facing times are in IST (India Standard Time).
+// We must compute nextSendTime in IST, then store as UTC ISO string.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 5 hours 30 minutes in ms
+
+function nowIST() {
+  // Returns a Date object whose UTC fields reflect the current IST time.
+  // e.g. if UTC is 09:37, this returns a Date where getUTCHours() === 15 (3 PM IST)
+  return new Date(Date.now() + IST_OFFSET_MS);
+}
+
+function makeDateIST(year, month, day, h, m) {
+  // Create a UTC-based Date representing the given clock time in IST.
+  // e.g. IST 15:07 on 2026-04-28 → UTC 09:37 on 2026-04-28
+  const utcMs = Date.UTC(year, month, day, h, m, 0, 0) - IST_OFFSET_MS;
+  return new Date(utcMs);
 }
 
 function computeNextSendTime(email) {
   const r = email.recurrence || {};
-  const now = new Date();
+
+  const nowUtc = new Date();
+  const nowIst = nowIST(); // UTC fields of this object reflect IST clock time
 
   // Parse time safely — default to 08:00
   const timeParts = (email.time || '08:00').split(':');
@@ -951,62 +966,63 @@ function computeNextSendTime(email) {
 
   if (r.once) return null;
 
-  // ── Hourly: exactly N hours from now ─────────────────────────────────────
+  // ── Hourly: exactly N hours from now (UTC, no timezone needed) ───────────
   if (r.hours) {
-    return new Date(now.getTime() + r.hours * 3_600_000).toISOString();
+    return new Date(nowUtc.getTime() + r.hours * 3_600_000).toISOString();
   }
 
-  // ── Daily: next occurrence of exact time ─────────────────────────────────
+  // ── Daily: next occurrence at exact IST time ──────────────────────────────
   if (r.days) {
-    const candidate = new Date(
-      now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+    const candidate = makeDateIST(
+      nowIst.getUTCFullYear(), nowIst.getUTCMonth(), nowIst.getUTCDate(), h, m
     );
-    // If today's time has already passed, move to tomorrow
-    if (candidate.getTime() <= now.getTime()) {
-      candidate.setDate(candidate.getDate() + r.days);
+    if (candidate.getTime() <= nowUtc.getTime()) {
+      return new Date(candidate.getTime() + 24 * 60 * 60 * 1000 * r.days).toISOString();
     }
     return candidate.toISOString();
   }
 
-  // ── Weekly: next occurrence of target weekday at exact time ──────────────
+  // ── Weekly: next occurrence of target weekday at exact IST time ───────────
   if (r.weeks) {
     const targetDay = typeof r.dayOfWeek === 'number' ? r.dayOfWeek : 1;
-    const candidate = new Date(
-      now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+    const istDayOfWeek = nowIst.getUTCDay(); // day of week in IST
+
+    const candidate = makeDateIST(
+      nowIst.getUTCFullYear(), nowIst.getUTCMonth(), nowIst.getUTCDate(), h, m
     );
-    let daysUntil = (targetDay - now.getDay() + 7) % 7;
-    // If today is the target day but time already passed (or just sent),
-    // schedule for NEXT week
-    if (daysUntil === 0) {
-      daysUntil = 7;
-    }
-    candidate.setDate(candidate.getDate() + daysUntil);
-    return candidate.toISOString();
+
+    let daysUntil = (targetDay - istDayOfWeek + 7) % 7;
+    // Always schedule for NEXT occurrence (not today even if same weekday)
+    if (daysUntil === 0) daysUntil = 7;
+
+    return new Date(candidate.getTime() + daysUntil * 24 * 60 * 60 * 1000).toISOString();
   }
 
-  // ── Monthly: same day-of-month next month at exact time ───────────────────
+  // ── Monthly: same day-of-month next month at exact IST time ──────────────
   if (r.months) {
-    const targetDOM = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : now.getDate();
-    // Always go to next month
-    const nextMonthDate = new Date(
-      now.getFullYear(), now.getMonth() + r.months, 1
-    );
-    const daysInNextMonth = new Date(
-      nextMonthDate.getFullYear(), nextMonthDate.getMonth() + 1, 0
-    ).getDate();
+    const targetDOM = Number.isFinite(r.dayOfMonth) ? r.dayOfMonth : nowIst.getUTCDate();
+    const nextMonthIst = new Date(Date.UTC(
+      nowIst.getUTCFullYear(),
+      nowIst.getUTCMonth() + r.months,
+      1
+    ));
+    const daysInNextMonth = new Date(Date.UTC(
+      nextMonthIst.getUTCFullYear(),
+      nextMonthIst.getUTCMonth() + 1,
+      0
+    )).getUTCDate();
     const clampedDay = Math.min(Math.max(1, targetDOM), daysInNextMonth);
-    const candidate = new Date(
-      nextMonthDate.getFullYear(), nextMonthDate.getMonth(), clampedDay, h, m, 0, 0
-    );
-    return candidate.toISOString();
+    return makeDateIST(
+      nextMonthIst.getUTCFullYear(), nextMonthIst.getUTCMonth(), clampedDay, h, m
+    ).toISOString();
   }
 
   // ── Fallback: daily ───────────────────────────────────────────────────────
-  const candidate = new Date(
-    now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0
+  const candidate = makeDateIST(
+    nowIst.getUTCFullYear(), nowIst.getUTCMonth(), nowIst.getUTCDate(), h, m
   );
-  if (candidate.getTime() <= now.getTime()) {
-    candidate.setDate(candidate.getDate() + 1);
+  if (candidate.getTime() <= nowUtc.getTime()) {
+    return new Date(candidate.getTime() + 24 * 60 * 60 * 1000).toISOString();
   }
   return candidate.toISOString();
 }
