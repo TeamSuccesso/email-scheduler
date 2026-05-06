@@ -620,7 +620,12 @@ app.post('/send-now', async (req, res) => {
     const now          = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
     const isOnce       = merged.recurrence?.once === true || merged.type === 'once';
-    const reachedMax   = merged.maxTimes !== 'indefinitely' && newSentCount >= parseInt(merged.maxTimes);
+    // BUGFIX: use Number.isFinite so NaN (from encrypted/invalid maxTimes) never
+    // triggers a false reachedMax and incorrectly marks the email as done.
+    const maxTimesNum  = parseInt(merged.maxTimes);
+    const reachedMax   = merged.maxTimes !== 'indefinitely'
+      && Number.isFinite(maxTimesNum)
+      && newSentCount >= maxTimesNum;
     const isDone       = isOnce || reachedMax;
     const nextSendTime = isDone ? null : computeNextSendTime(merged);
 
@@ -930,8 +935,16 @@ async function releaseSendLock(emailId) {
 }
 
 function isEmailDone(email) {
-  const isOnce     = email.recurrence?.once === true || email.type === 'once';
-  const reachedMax = email.maxTimes !== 'indefinitely' && (email.sentCount || 0) >= parseInt(email.maxTimes);
+  const isOnce = email.recurrence?.once === true || email.type === 'once';
+  // BUGFIX: maxTimes may be an AES-encrypted string when called on a raw DB doc
+  // (before decryptEmailDoc). parseInt of an encrypted blob = NaN, and x >= NaN
+  // is always false — so reachedMax would never trigger on encrypted docs.
+  // Safe guard: treat any non-numeric, non-'indefinitely' value as 'indefinitely'.
+  const maxTimesRaw = email.maxTimes;
+  const maxTimesNum = parseInt(maxTimesRaw);
+  const reachedMax  = maxTimesRaw !== 'indefinitely'
+    && Number.isFinite(maxTimesNum)   // ← only true for real numeric strings
+    && (email.sentCount || 0) >= maxTimesNum;
   return !email.active || (isOnce && (email.sentCount || 0) >= 1) || reachedMax;
 }
 
@@ -1148,13 +1161,28 @@ async function sendEmailViaGmail(email, instanceId = null) {
   const raw = Buffer.from(mime, 'utf8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
   // LAST RESORT: Re-read DB immediately before calling Gmail API.
-  // If another process already sent this within the last 5 minutes, abort.
-  // This is the final safety net when all lock mechanisms have been bypassed.
+  // If another process already sent this for the CURRENT scheduled window, abort.
+  // Use recurrence-aware window: for hourly emails, allow up to (hours - 2min) gap.
+  // For all others, use 5 minutes as the duplicate window.
   if (email.id) {
     const freshCheck = await Email.findOne({ id: email.id }).lean();
-    if (freshCheck?.lastSent) {
+    if (freshCheck?.lastSent && freshCheck?.nextSendTime) {
+      const lastSentMs   = new Date(freshCheck.lastSent).getTime();
+      const nextSendMs   = new Date(freshCheck.nextSendTime).getTime();
+      // If lastSent is >= nextSendTime, this window was already handled
+      if (lastSentMs >= nextSendMs) {
+        throw new Error(
+          'DUPLICATE_PREVENTED: lastSent(' + new Date(lastSentMs).toISOString() + ') >= nextSendTime(' + new Date(nextSendMs).toISOString() + ') for id=' + String(email.id)
+        );
+      }
+    } else if (freshCheck?.lastSent) {
+      // Fallback: no nextSendTime — use recurrence interval as the window
+      const recurrenceMs = email.recurrence?.hours
+        ? email.recurrence.hours * 3_600_000
+        : 5 * 60_000;
+      const windowMs = Math.max(recurrenceMs - 2 * 60_000, 5 * 60_000);
       const msSince = Date.now() - new Date(freshCheck.lastSent).getTime();
-      if (msSince < 5 * 60 * 1000) {
+      if (msSince < windowMs) {
         throw new Error(
           'DUPLICATE_PREVENTED: already sent ' + Math.round(msSince / 1000) + 's ago for id=' + String(email.id)
         );
@@ -1231,11 +1259,15 @@ async function runSchedulerTick() {
     if (sendAt > now) continue;
 
     if (email.lastSent) {
-      const diffMs = now.getTime() - new Date(email.lastSent).getTime();
-      if (diffMs < 5 * 60 * 1000) {
-        // 5-minute guard: prevents re-fire even if Chrome and cron both attempt
-        // to send within the same recurrence window
-        console.log(`[cron] Duplicate prevented (sent ${Math.round(diffMs/1000)}s ago):`, email.id);
+      const diffMs = sendAt.getTime() - new Date(email.lastSent).getTime();
+      // BUGFIX: Compare lastSent against the SCHEDULED send time, not now.
+      // Previously: (now - lastSent) < 5min → skipped sends if cron ran shortly
+      // after a successful send, even when the next scheduled time was already due.
+      // Now: only skip if lastSent is AFTER the scheduled send time (already sent
+      // for this window). A negative or small diffMs means it was sent after
+      // nextSendTime — i.e. already handled. Positive diffMs means not yet sent.
+      if (diffMs < 0) {
+        console.log(`[cron] Duplicate prevented (lastSent=${new Date(email.lastSent).toISOString()} is after scheduled=${sendAt.toISOString()}):`, email.id);
         continue;
       }
     }
@@ -1263,9 +1295,10 @@ async function runSchedulerTick() {
     const freshEmail = await Email.findOne({ id: email.id });
 
     if (freshEmail && freshEmail.lastSent) {
-      const diffMs = Date.now() - new Date(freshEmail.lastSent).getTime();
-      if (diffMs < 5 * 60 * 1000) {
-        console.log('[cron] Aborting: already sent ' + Math.round(diffMs/1000) + 's ago (fresh read):', email.id);
+      const diffMs = sendAt.getTime() - new Date(freshEmail.lastSent).getTime();
+      // BUGFIX: Same fix as above — compare lastSent against scheduled time, not now.
+      if (diffMs < 0) {
+        console.log('[cron] Aborting: lastSent is after scheduled time (fresh read):', email.id);
         await releaseSendLock(email.id);
         continue;
       }
@@ -1308,7 +1341,12 @@ async function runSchedulerTick() {
 
       const newSentCount = (emailToSend.sentCount || 0) + 1;
       const isOnce       = emailToSend.recurrence?.once === true || emailToSend.type === 'once';
-      const reachedMax   = emailToSend.maxTimes !== 'indefinitely' && newSentCount >= parseInt(emailToSend.maxTimes);
+      // BUGFIX: use Number.isFinite so NaN (from encrypted/invalid maxTimes) never
+      // triggers a false reachedMax and incorrectly stops the email.
+      const maxTimesNum  = parseInt(emailToSend.maxTimes);
+      const reachedMax   = emailToSend.maxTimes !== 'indefinitely'
+        && Number.isFinite(maxTimesNum)
+        && newSentCount >= maxTimesNum;
       const isDone       = isOnce || reachedMax;
       const nextSendTime = isDone ? null : computeNextSendTime(emailToSend);
 
@@ -1407,4 +1445,13 @@ app.post('/heartbeat', (req, res) => {
   if (userEmail) chromeHeartbeat.set(userEmail, Date.now());
   // END CHANGED
   res.json({ ok: true });
+});
+
+app.get('/ping', async (req, res) => {
+  try {
+    await runSchedulerTick();
+    res.json({ ok: true, time: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
