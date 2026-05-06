@@ -1320,10 +1320,10 @@ async function runSchedulerTick() {
     const twoMinutesAgo   = Date.now() - (2 * 60 * 1000);
     const chromeIsAlive   = !!(lastHeartbeat && lastHeartbeat > twoMinutesAgo);
 
-    if (chromeIsAlive) {
-      console.log('[cron] Chrome active for ' + ownerEmailLower + ' — skipping server send:', email.id);
-      continue;
-    }
+    // NOTE: Do not skip server send just because Chrome is alive.
+    // Chrome alarms/service-worker scheduling is not guaranteed to run exactly on time,
+    // but the server scheduler is authoritative. Duplicate sends are prevented by the
+    // MongoDB send lock + lastSent vs scheduled-time checks.
 
     const locked = await tryAcquireSendLock(email.id);
     if (!locked) continue;
@@ -1449,7 +1449,10 @@ async function runEmailCron() {
   }
 }
 
-cron.schedule('* * * * *', runEmailCron);
+// Run frequently to minimize send-time drift. Supports seconds-field syntax in node-cron.
+// Example: "*/10 * * * * *" (every 10 seconds). Default is every 10 seconds.
+const CRON_EXPR = (process.env.CRON_EXPR || '*/10 * * * * *').toString().trim();
+cron.schedule(CRON_EXPR, runEmailCron);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
