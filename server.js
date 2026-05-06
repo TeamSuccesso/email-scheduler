@@ -761,14 +761,50 @@ app.get('/emails', async (req, res) => {
     }
 
     const userEmailLower = userEmail ? userEmail.toLowerCase() : '';
-    const filter = userEmail ? { $or: [{ userEmailLower }, { userEmail }] } : {};
 
-    // BUG 3 FIX: Return all emails (active AND inactive), limit 200, sorted newest-first.
-    // Previously missing .limit() and only returning active emails caused popup to show only 1-2.
-    let emails = await Email.find(filter).select('-attachments').sort({ createdAt: -1 }).limit(200);
+    // Try 1: query by userEmailLower (stored plaintext for querying)
+    let emails = [];
+    if (userEmail) {
+      emails = await Email.find({ userEmailLower }).select('-attachments').sort({ createdAt: -1 }).limit(200);
+    }
 
+    // Try 2: query by encrypted userEmail value
     if (userEmail && !emails.length) {
-      emails = await Email.find({ userEmail }).collation({ locale: 'en', strength: 2 }).select('-attachments').sort({ createdAt: -1 }).limit(200);
+      try {
+        const encryptedEmail = encrypt(userEmail);
+        emails = await Email.find({ userEmail: encryptedEmail }).select('-attachments').sort({ createdAt: -1 }).limit(200);
+      } catch (_) {}
+    }
+
+    // Try 3: get ALL emails and filter by decrypting (fallback for migration)
+    if (userEmail && !emails.length) {
+      try {
+        const allEmails = await Email.find({}).select('-attachments').sort({ createdAt: -1 }).limit(500);
+        emails = allEmails.filter(e => {
+          try {
+            const decrypted = decrypt(e.userEmail || '');
+            return decrypted && decrypted.toLowerCase() === userEmailLower;
+          } catch (_) {
+            return false;
+          }
+        });
+        // Fix userEmailLower for any found emails that are missing it
+        if (emails.length) {
+          for (const e of emails) {
+            if (!e.userEmailLower) {
+              await Email.findOneAndUpdate(
+                { id: e.id },
+                { userEmailLower }
+              );
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Try 4: no filter — return all if no userEmail provided
+    if (!userEmail) {
+      emails = await Email.find({}).select('-attachments').sort({ createdAt: -1 }).limit(200);
     }
 
     if (userEmail && !emails.length) {
