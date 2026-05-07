@@ -1320,10 +1320,14 @@ async function runSchedulerTick() {
     const twoMinutesAgo   = Date.now() - (2 * 60 * 1000);
     const chromeIsAlive   = !!(lastHeartbeat && lastHeartbeat > twoMinutesAgo);
 
-    // NOTE: Do not skip server send just because Chrome is alive.
-    // Chrome alarms/service-worker scheduling is not guaranteed to run exactly on time,
-    // but the server scheduler is authoritative. Duplicate sends are prevented by the
-    // MongoDB send lock + lastSent vs scheduled-time checks.
+    // CHANGE: If Chrome is alive, prefer Chrome to send (prevents duplicates).
+    // The server only sends when Chrome is offline, or when the schedule is overdue
+    // by a grace period (Chrome might be stuck/asleep even while "alive").
+    const CHROME_GRACE_MS = 3 * 60 * 1000;
+    if (chromeIsAlive && (Date.now() - sendAt.getTime()) < CHROME_GRACE_MS) {
+      console.log('[cron] Chrome is alive; skipping server send for', email.id);
+      continue;
+    }
 
     const locked = await tryAcquireSendLock(email.id);
     if (!locked) continue;
