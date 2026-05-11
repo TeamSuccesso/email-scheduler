@@ -615,7 +615,20 @@ app.post('/send-now', async (req, res) => {
 
     // Decrypt and send
     const lockedPlain = decryptEmailDoc(merged);
-    await sendEmailViaGmail(lockedPlain, instanceId);
+    try {
+      await sendEmailViaGmail(lockedPlain, instanceId);
+    } catch (sendErr) {
+      const msg = String(sendErr?.message || sendErr || '');
+      if (msg.startsWith('DUPLICATE_PREVENTED:')) {
+        // Treat as a success/no-op: another process already handled this window.
+        // Return the latest DB state so Chrome can reschedule correctly.
+        const current = await Email.findOne({ id: merged.id });
+        const currentPlain = decryptEmailDoc(current?.toObject ? current.toObject() : current);
+        const payload = stripEmailPayload(currentPlain);
+        return res.json({ ok: true, skipped: true, reason: 'duplicate_prevented', email: payload, message: msg });
+      }
+      throw sendErr;
+    }
 
     const now          = new Date();
     const newSentCount = (merged.sentCount || 0) + 1;
@@ -1207,6 +1220,20 @@ async function sendEmailViaGmail(email, instanceId = null) {
       const nextSendMs   = new Date(freshCheck.nextSendTime).getTime();
       // If lastSent is >= nextSendTime, this window was already handled
       if (lastSentMs >= nextSendMs) {
+        // This can also happen if the process crashed after Gmail send but before
+        // nextSendTime was advanced in MongoDB (stuck schedule). Best-effort: bump
+        // nextSendTime forward so the email doesn't appear "stuck" (commonly seen
+        // with hourly schedules).
+        try {
+          const decrypted = decryptEmailDoc(freshCheck);
+          if (decrypted && decrypted.active && !isEmailDone(decrypted)) {
+            const bumped = computeNextSendTime(decrypted);
+            if (bumped) {
+              await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: bumped }, { returnDocument: 'after' });
+              console.log('[send] Advanced stale nextSendTime after duplicate-prevented:', { id: email.id, from: new Date(nextSendMs).toISOString(), to: bumped });
+            }
+          }
+        } catch (_) {}
         throw new Error(
           'DUPLICATE_PREVENTED: lastSent(' + new Date(lastSentMs).toISOString() + ') >= nextSendTime(' + new Date(nextSendMs).toISOString() + ') for id=' + String(email.id)
         );
@@ -1304,6 +1331,13 @@ async function runSchedulerTick() {
       // nextSendTime — i.e. already handled. Positive diffMs means not yet sent.
       if (diffMs < 0) {
         console.log(`[cron] Duplicate prevented (lastSent=${new Date(email.lastSent).toISOString()} is after scheduled=${sendAt.toISOString()}):`, email.id);
+        // If nextSendTime is stale (still behind lastSent), bump it forward so the
+        // schedule doesn't get stuck in a permanent "duplicate prevented" loop.
+        try {
+          const decrypted = decryptEmailDoc(email.toObject ? email.toObject() : email);
+          const bumped = (decrypted && decrypted.active && !isEmailDone(decrypted)) ? computeNextSendTime(decrypted) : null;
+          if (bumped) await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: bumped });
+        } catch (_) {}
         continue;
       }
     }
@@ -1339,6 +1373,11 @@ async function runSchedulerTick() {
       // BUGFIX: Same fix as above — compare lastSent against scheduled time, not now.
       if (diffMs < 0) {
         console.log('[cron] Aborting: lastSent is after scheduled time (fresh read):', email.id);
+        try {
+          const decrypted = decryptEmailDoc(freshEmail.toObject ? freshEmail.toObject() : freshEmail);
+          const bumped = (decrypted && decrypted.active && !isEmailDone(decrypted)) ? computeNextSendTime(decrypted) : null;
+          if (bumped) await Email.findOneAndUpdate({ id: email.id }, { nextSendTime: bumped });
+        } catch (_) {}
         await releaseSendLock(email.id);
         continue;
       }
@@ -1494,6 +1533,46 @@ app.get('/ping', async (req, res) => {
   try {
     await runSchedulerTick();
     res.json({ ok: true, time: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Minimal diagnostics endpoint to help verify scheduler/DB/heartbeat behavior.
+// If CRON_SECRET is set, require `Authorization: Bearer <CRON_SECRET>`.
+app.get('/status', async (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  if (secret) {
+    const authHeader = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+    if (authHeader !== secret) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+
+  try {
+    const now = new Date();
+    const activeCount = await Email.countDocuments({ active: true });
+    const due = await Email.find({ active: true, nextSendTime: { $ne: null } })
+      .sort({ nextSendTime: 1 })
+      .limit(50)
+      .lean();
+
+    const dueNow = [];
+    const nextUp = [];
+    for (const e of due) {
+      const nextMs = e?.nextSendTime ? new Date(e.nextSendTime).getTime() : NaN;
+      const item = { id: e?.id || null, subject: e?.subject || '', nextSendTime: e?.nextSendTime || null, lastSent: e?.lastSent || null, inFlightUntil: e?.inFlightUntil || null };
+      if (Number.isFinite(nextMs) && nextMs <= now.getTime()) dueNow.push(item);
+      else nextUp.push(item);
+      if (dueNow.length >= 10 && nextUp.length >= 10) break;
+    }
+
+    res.json({
+      ok: true,
+      time: now.toISOString(),
+      mongo: { readyState: mongoose?.connection?.readyState ?? null },
+      counts: { active: activeCount, heartbeatKeys: chromeHeartbeat.size },
+      dueNow,
+      nextUp: nextUp.slice(0, 10),
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
